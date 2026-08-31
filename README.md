@@ -58,14 +58,17 @@ Everything below is a small, clearly marked edit in `App.swift`. The app is one 
 
 ### Your terminal is not Ghostty
 
-Two places assume it:
+Two constants at the top of `Hosts`, and nothing else:
 
-- `Hosts.ghosttyPath` resolves the bundle id `com.mitchellh.ghostty`. Change it to yours, for
-  example `com.mitchellh.cmux`, `com.googlecode.iterm2`, or `com.apple.Terminal`.
-- `Hosts.host(of:table:)` labels herdr-hosted sessions `"Ghostty · herdr"`. herdr runs as a
-  detached server, so its process ancestry ends at `launchd` rather than at the terminal that
-  draws it, which is why the terminal is named there rather than detected. Change the string to
-  match.
+```swift
+static let herdrTerminalBundleID = "com.mitchellh.ghostty"
+static let herdrTerminalLabel = "Ghostty · herdr"
+```
+
+Set the bundle id to yours, for example `com.googlecode.iterm2` or `com.apple.Terminal`, and the
+label to match. They exist because herdr runs as a detached server, so its process ancestry ends at
+`launchd` rather than at the terminal that draws it: the terminal has to be named rather than
+detected.
 
 Everything else adapts on its own. Host detection walks the process tree until it finds an `.app`
 bundle, so cmux, iTerm, WezTerm, kitty, VS Code, GoLand, WebStorm and friends are all identified

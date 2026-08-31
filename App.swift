@@ -236,8 +236,15 @@ enum Hosts {
         let appPath: String? // nil for a bare CLI multiplexer
     }
 
-    private static let ghosttyPath: String? = NSWorkspace.shared
-        .urlForApplication(withBundleIdentifier: "com.mitchellh.ghostty")?.path
+    // Change these two for a different terminal. herdr runs as a detached
+    // server, so its process ancestry ends at launchd rather than at the
+    // terminal drawing it, which is why the terminal is named rather than
+    // detected. Everything not behind herdr is detected from the process tree.
+    static let herdrTerminalBundleID = "com.mitchellh.ghostty"
+    static let herdrTerminalLabel = "Ghostty · herdr"
+
+    static let herdrTerminalPath: String? = NSWorkspace.shared
+        .urlForApplication(withBundleIdentifier: herdrTerminalBundleID)?.path
 
     // Climb the parent chain until an .app bundle or a known host shows up.
     static func host(of pid: Int32,
@@ -257,7 +264,8 @@ enum Hosts {
             // ponytail: herdr is a detached server, its ancestry ends at launchd.
             // This user's herdr renders in Ghostty (see dev-setup repo).
             if base == "herdr" {
-                return HostApp(name: "Ghostty · herdr", appPath: ghosttyPath)
+                return HostApp(name: herdrTerminalLabel,
+                               appPath: herdrTerminalPath)
             }
             if ["tmux", "zellij", "screen"].contains(base) {
                 return HostApp(name: base, appPath: nil)
@@ -712,8 +720,6 @@ enum Sessions {
         let codex = agents.filter { $0.agent == "codex" }
         guard !codex.isEmpty else { return [] }
         let files = Codex.recentFiles()
-        let ghostty = NSWorkspace.shared
-            .urlForApplication(withBundleIdentifier: "com.mitchellh.ghostty")?.path
 
         return codex.map { agent in
             let info = Codex.info(cwd: agent.cwd, files: files)
@@ -733,8 +739,8 @@ enum Sessions {
                 model: info.model,
                 contextTokens: info.tokens,
                 contextWindow: info.contextWindow,
-                host: "Ghostty · herdr",
-                hostAppPath: ghostty
+                host: Hosts.herdrTerminalLabel,
+                hostAppPath: Hosts.herdrTerminalPath
             )
         }
     }
