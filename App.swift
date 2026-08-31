@@ -19,11 +19,14 @@ enum Ph {
     static let minusBold = load("minus-bold")
     static let plusBold = load("plus-bold")
     static let cornersOutBold = load("corners-out-bold")
+    static let magnifyingGlassBold = load("magnifying-glass-bold")
+    static let xBold = load("x-bold")
 
     static let names = [
         "lightning-fill", "moon-fill", "warning-fill", "check-circle-fill",
         "question-fill", "hexagon-bold", "list-dashes-bold", "moon-stars-duotone",
         "chart-bar-bold", "minus-bold", "plus-bold", "corners-out-bold",
+        "magnifying-glass-bold", "x-bold",
     ]
 
     static func url(_ name: String) -> URL? {
@@ -780,6 +783,49 @@ func formatTokens(_ n: Int) -> String {
     return "\(n)"
 }
 
+// MARK: - Fuzzy filter
+
+// Subsequence match: every query character must appear in order, so "wzenv"
+// finds "wizard-of-envs". The score rewards consecutive hits and matches that
+// start a word, which keeps the obvious candidate on top. nil means no match.
+func fuzzyScore(_ query: String, _ candidate: String) -> Int? {
+    let needle = Array(query.lowercased())
+    guard !needle.isEmpty else { return 0 }
+    let haystack = Array(candidate.lowercased())
+    guard needle.count <= haystack.count else { return nil }
+
+    var index = 0
+    var score = 0
+    var streak = 0
+    for (position, character) in haystack.enumerated() {
+        guard index < needle.count, character == needle[index] else {
+            streak = 0
+            continue
+        }
+        streak += 1
+        var points = 1 + streak * 2
+        let boundary = position == 0
+            || "-_ /.:".contains(haystack[position - 1])
+        if boundary { points += 6 }
+        if position == 0 { points += 4 }
+        score += points
+        index += 1
+    }
+    return index == needle.count ? score : nil
+}
+
+// Best score over the fields worth searching, name weighted highest.
+func tileScore(_ query: String, _ tile: SessionTile) -> Int? {
+    let fields: [(String, Int)] = [
+        (tile.name, 3), (tile.dir, 2), (tile.agent, 1),
+        (tile.model ?? "", 1), (tile.host ?? "", 1), (tile.status, 1),
+    ]
+    let scores = fields.compactMap { field, weight in
+        fuzzyScore(query, field).map { $0 * weight }
+    }
+    return scores.max()
+}
+
 enum ViewMode: String, CaseIterable, Identifiable {
     case orbs, table
     var id: String { rawValue }
@@ -1417,10 +1463,49 @@ struct AgentTabs: View {
     }
 }
 
+struct SearchField: View {
+    @Binding var query: String
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Ph.magnifyingGlassBold.scaledToFit()
+                .foregroundStyle(.secondary)
+                .frame(width: 11, height: 11)
+            TextField("Filter", text: $query)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12, design: .rounded))
+                .focused($focused)
+                .frame(width: 110)
+                .onSubmit { focused = false }
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Ph.xBold.scaledToFit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: 9, height: 9)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
+            }
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .glassEffect(.regular, in: .capsule)
+        .overlay {
+            // Focus the field from anywhere without stealing a visible control.
+            Button("") { focused = true }
+                .keyboardShortcut("f", modifiers: .command)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+        }
+    }
+}
+
 struct HeaderView: View {
     let tiles: [SessionTile]
     @Binding var mode: ViewMode
     @Binding var agentFilter: String
+    @Binding var query: String
     let agentCounts: [String: Int]
     private static let order = ["working", "done", "blocked", "idle", "unknown"]
 
@@ -1432,6 +1517,7 @@ struct HeaderView: View {
                 AgentTabs(selection: $agentFilter, counts: agentCounts)
             }
             Spacer()
+            SearchField(query: $query)
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
                     ForEach(Self.order, id: \.self) { status in
@@ -1783,15 +1869,18 @@ struct StatsView: View {
 }
 
 struct EmptyStateView: View {
+    var query: String = ""
+
     var body: some View {
+        let searching = !query.trimmingCharacters(in: .whitespaces).isEmpty
         VStack(spacing: 14) {
-            Ph.moonStarsDuotone
+            (searching ? Ph.magnifyingGlassBold : Ph.moonStarsDuotone)
                 .scaledToFit()
                 .foregroundStyle(.secondary)
                 .frame(width: 40, height: 40)
                 .padding(36)
                 .glassEffect(.regular, in: .circle)
-            Text("No open Claude sessions")
+            Text(searching ? "Nothing matches “\(query)”" : "No open sessions")
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
                 .foregroundStyle(.secondary)
         }
@@ -1814,10 +1903,20 @@ struct ContentView: View {
     @State private var pinchStart: Double?
     @AppStorage("agentFilter") private var agentFilter: String = "all"
 
+    @State private var query = ""
+
     private var tiles: [SessionTile] {
-        agentFilter == "all"
+        let byAgent = agentFilter == "all"
             ? model.tiles
             : model.tiles.filter { $0.agent == agentFilter }
+        let search = query.trimmingCharacters(in: .whitespaces)
+        guard !search.isEmpty else { return byAgent }
+        // Best matches first while filtering; alphabetical otherwise.
+        return byAgent.compactMap { tile in
+            tileScore(search, tile).map { (tile, $0) }
+        }
+        .sorted { $0.1 > $1.1 }
+        .map(\.0)
     }
 
     var body: some View {
@@ -1825,10 +1924,10 @@ struct ContentView: View {
             MeshBackground()
             VStack(spacing: 0) {
                 HeaderView(tiles: tiles, mode: $mode, agentFilter: $agentFilter,
-                           agentCounts: model.agentCounts)
+                           query: $query, agentCounts: model.agentCounts)
                 Group {
                     if tiles.isEmpty {
-                        EmptyStateView()
+                        EmptyStateView(query: query)
                     } else if mode == .table {
                         SessionTableView(tiles: tiles, focus: model.focus,
                                          requestKill: requestKill)
@@ -1846,7 +1945,9 @@ struct ContentView: View {
         }
         .animation(.spring(duration: 0.5), value: model.tiles)
         .animation(.spring(duration: 0.5), value: model.usageLimits)
-        .frame(minWidth: 480, minHeight: 340)
+        // The header now carries title, agent tabs, search, status counts and
+        // the view toggle, which need the room.
+        .frame(minWidth: 660, minHeight: 360)
         .confirmationDialog(
             "Kill \(killTarget?.name ?? "session")?",
             isPresented: $confirmKill, presenting: killTarget
@@ -2008,6 +2109,24 @@ struct HivemindApp: App {
                 print("stats\t\(day.formatted(date: .numeric, time: .omitted))"
                       + "\t\(formatTokens(tokens))")
             }
+            precondition(fuzzyScore("wiz", "wizard-of-envs") != nil)
+            precondition(fuzzyScore("wzenv", "wizard-of-envs") != nil,
+                         "gapped subsequence must match")
+            precondition(fuzzyScore("zzz", "wizard-of-envs") == nil,
+                         "out-of-order characters must not match")
+            precondition(fuzzyScore("", "anything") == 0, "empty query matches")
+            precondition(fuzzyScore("toolong", "abc") == nil,
+                         "query longer than candidate cannot match")
+            // A prefix run must outrank the same letters scattered.
+            let tight = fuzzyScore("diag", "diagrams")!
+            let loose = fuzzyScore("diag", "dxixaxg")!
+            precondition(tight > loose, "consecutive match must score higher")
+            // Word starts count: "oe" should favour of-envs over a mid-word hit.
+            precondition(fuzzyScore("oe", "of-envs")!
+                         > fuzzyScore("oe", "codex-mode")!,
+                         "word-boundary match must score higher")
+            print("fuzzy ok; wiz->wizard-of-envs scores \(tight)")
+
             // Exercise the Codex rollout parser on a real main-session file.
             let codexFiles = Codex.recentFiles()
             for url in codexFiles {
