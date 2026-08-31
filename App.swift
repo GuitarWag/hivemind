@@ -1536,17 +1536,17 @@ struct ContentView: View {
                 }
                 .onEnded { _ in pinchStart = nil }
         )
-        .overlay(alignment: .bottomLeading) {
-            ZoomControls(zoom: $zoom, fit: fitToView).padding(14)
-        }
         .overlay(alignment: .bottomTrailing) {
-            if overflows {
-                Minimap(tiles: model.tiles, layout: layout, visible: visible,
-                        contentSize: contentSize) { point in
-                    scroll.scrollTo(point: point)
+            VStack(alignment: .trailing, spacing: 10) {
+                if overflows {
+                    Minimap(tiles: model.tiles, layout: layout, visible: visible,
+                            contentSize: contentSize) { point in
+                        scroll.scrollTo(point: point)
+                    }
                 }
-                .padding(14)
+                ZoomControls(zoom: $zoom, fit: fitToView)
             }
+            .padding(14)
         }
         .onKeyPress { press in
             let step = CGSize(width: visible.width / 2, height: visible.height / 2)
