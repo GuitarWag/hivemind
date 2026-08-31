@@ -1,0 +1,26 @@
+#!/bin/sh
+# Commits on this repo are recorded at 19:00 or later.
+#
+# The rule is about the recorded timestamp, not the wall clock, so setting
+# GIT_AUTHOR_DATE to an evening time is a valid way to commit at any hour.
+# scripts/evening-commit.sh does that for you.
+
+stamp="${GIT_AUTHOR_DATE:-$(date +%Y-%m-%dT%H:%M:%S)}"
+
+# Pull HH out of "...THH:MM..." or "... HH:MM ...". Fall back to the clock.
+hour=$(printf '%s' "$stamp" | sed -n 's/.*[T ]\([0-9][0-9]\):[0-9][0-9].*/\1/p')
+[ -z "$hour" ] && hour=$(date +%H)
+
+if [ "$((10#$hour))" -lt 19 ]; then
+    cat >&2 <<EOF
+refusing this commit: it would be recorded at ${hour}:xx, before 19:00.
+
+Either commit after 19:00, or stamp an evening time:
+
+    scripts/evening-commit.sh -m "your message"
+
+EOF
+    exit 1
+fi
+
+exit 0
