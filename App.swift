@@ -1517,7 +1517,6 @@ struct HeaderView: View {
                 AgentTabs(selection: $agentFilter, counts: agentCounts)
             }
             Spacer()
-            SearchField(query: $query)
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
                     ForEach(Self.order, id: \.self) { status in
@@ -1530,6 +1529,9 @@ struct HeaderView: View {
             }
             ViewModeToggle(mode: $mode)
         }
+        // Overlaid rather than placed in the row, so the field sits at the true
+        // centre of the header instead of wherever the side groups leave it.
+        .overlay { SearchField(query: $query) }
         .padding(.horizontal, 22)
         .padding(.top, 34) // keep clear of the traffic lights
     }
@@ -1945,9 +1947,10 @@ struct ContentView: View {
         }
         .animation(.spring(duration: 0.5), value: model.tiles)
         .animation(.spring(duration: 0.5), value: model.usageLimits)
-        // The header now carries title, agent tabs, search, status counts and
-        // the view toggle, which need the room.
-        .frame(minWidth: 660, minHeight: 360)
+        // The header carries title, agent tabs, status counts and the view
+        // toggle around a centred search field, which needs the room to not
+        // collide with the side groups.
+        .frame(minWidth: 820, minHeight: 360)
         .confirmationDialog(
             "Kill \(killTarget?.name ?? "session")?",
             isPresented: $confirmKill, presenting: killTarget
