@@ -980,8 +980,8 @@ struct InfoCard: View {
                                           design: .rounded))
                             .monospacedDigit()
                     }
-                    ProgressView(value: min(1, Double(tokens) / Double(cap)))
-                        .tint(color)
+                    UsageBar(percent: Double(tokens) / Double(cap) * 100,
+                             color: color, height: 5)
                 }
             }
         }
@@ -1234,6 +1234,27 @@ struct SessionTableView: View {
     }
 }
 
+// Explicit track and fill rather than ProgressView: a determinate linear
+// ProgressView does not paint reliably inside a Button label, which is where
+// the expanded usage widget lives.
+struct UsageBar: View {
+    let percent: Double
+    let color: Color
+    var height: CGFloat = 6
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(color.gradient)
+                    .frame(width: geo.size.width
+                           * min(1, max(0, percent / 100)))
+            }
+        }
+        .frame(height: height)
+    }
+}
+
 func usageColor(_ percent: Double) -> Color {
     if percent >= 95 { return .red }
     if percent >= 80 { return .orange }
@@ -1264,8 +1285,7 @@ struct UsageGauge: View {
                     .monospacedDigit()
                     .foregroundStyle(color)
             }
-            ProgressView(value: min(1, limit.percent / 100))
-                .tint(color)
+            UsageBar(percent: limit.percent, color: color)
             Text(limit.resetsAt.map {
                 "resets \($0.formatted(.relative(presentation: .named)))" } ?? " ")
                 .font(.system(size: 10, design: .rounded))
@@ -1332,12 +1352,8 @@ struct UsagePanel: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 38, alignment: .leading)
                 .lineLimit(1)
-            Capsule().fill(.quaternary)
-                .frame(width: 44, height: 4)
-                .overlay(alignment: .leading) {
-                    Capsule().fill(color.gradient)
-                        .frame(width: 44 * min(1, limit.percent / 100), height: 4)
-                }
+            UsageBar(percent: limit.percent, color: color, height: 4)
+                .frame(width: 44)
             if limit.percent >= 80 {
                 Ph.warningFill.scaledToFit()
                     .foregroundStyle(color)
