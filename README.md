@@ -129,6 +129,20 @@ window. A pulsing status icon measured 12-21% CPU while idle; without it the app
 One-shot animations tied to a hover or a click are fine, and the app uses several. Repeating ones
 are not.
 
+## What it touches
+
+Worth knowing before you run someone else's monitoring app:
+
+- It reads only. The one exception is the Kill action in a tile's context menu, which sends
+  `SIGTERM` to that session's process after you confirm a dialog naming the session and its pid.
+- It reads your Claude Code OAuth token from the keychain item `Claude Code-credentials` and sends
+  it to `https://api.anthropic.com/api/oauth/usage`, and nowhere else. That is the same endpoint and
+  the same token Claude Code itself uses for `/usage`. The token is never written to disk, never
+  logged, and never printed by `--dump`.
+- No other network request is made. Session names, folders, prompts and transcript content stay on
+  your machine.
+- It shells out to `herdr` for the session list and to `ps` for process ancestry.
+
 ## Adding an icon
 
 Icons are [Phosphor](https://phosphoricons.com) SVGs, vendored into `icons/` (MIT, see
