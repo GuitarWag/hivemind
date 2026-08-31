@@ -87,6 +87,75 @@ struct SessionTile: Identifiable, Equatable {
     let hostAppPath: String?
 }
 
+// MARK: - Caching
+
+// The session list refreshes every 2 seconds, and re-reading every transcript
+// tail and every Codex rollout header on each tick costs megabytes of reads and
+// hundreds of JSON parses per minute. These caches key on the file's
+// modification date and size, so an unchanged file is parsed once.
+final class FileCache<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [String: (stamp: Date, size: Int, value: Value)] = [:]
+    // Content that never changes once written (a rollout's first line) can skip
+    // the staleness check entirely.
+    private let immutableContent: Bool
+
+    init(immutableContent: Bool = false) {
+        self.immutableContent = immutableContent
+    }
+
+    func value(for url: URL, compute: (URL) -> Value) -> Value {
+        var stamp = Date.distantPast
+        var size = 0
+        if !immutableContent {
+            let attributes = try? FileManager.default
+                .attributesOfItem(atPath: url.path)
+            stamp = attributes?[.modificationDate] as? Date ?? .distantPast
+            size = attributes?[.size] as? Int ?? 0
+        }
+
+        lock.lock()
+        if let hit = entries[url.path],
+           immutableContent || (hit.stamp == stamp && hit.size == size) {
+            lock.unlock()
+            return hit.value
+        }
+        lock.unlock()
+
+        let fresh = compute(url)
+        lock.lock()
+        entries[url.path] = (stamp, size, fresh)
+        lock.unlock()
+        return fresh
+    }
+}
+
+// A value recomputed at most once per interval.
+final class TimedCache<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private let interval: TimeInterval
+    private var computedAt = Date.distantPast
+    private var value: Value?
+
+    init(interval: TimeInterval) { self.interval = interval }
+
+    func value(compute: () -> Value) -> Value {
+        lock.lock()
+        if let value, Date().timeIntervalSince(computedAt) < interval {
+            lock.unlock()
+            return value
+        }
+        lock.unlock()
+
+        let fresh = compute()
+        lock.lock()
+        value = fresh
+        computedAt = Date()
+        lock.unlock()
+        return fresh
+    }
+}
+
 // MARK: - Subprocesses
 
 @discardableResult
@@ -210,9 +279,19 @@ enum Transcript {
             + "/.claude/projects/\(slug)/\(sessionId).jsonl"
     }
 
+    private static let cache = FileCache<(model: String?, tokens: Int?)>()
+
     // Read the tail and take model + usage from the last assistant message.
     static func info(sessionId: String, cwd: String) -> (model: String?, tokens: Int?) {
-        guard let fh = FileHandle(forReadingAtPath: path(sessionId: sessionId, cwd: cwd))
+        let file = path(sessionId: sessionId, cwd: cwd)
+        guard FileManager.default.fileExists(atPath: file) else { return (nil, nil) }
+        return cache.value(for: URL(fileURLWithPath: file)) { _ in
+            parse(file)
+        }
+    }
+
+    private static func parse(_ file: String) -> (model: String?, tokens: Int?) {
+        guard let fh = FileHandle(forReadingAtPath: file)
         else { return (nil, nil) }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
@@ -425,8 +504,19 @@ enum Codex {
         var name: String?
     }
 
-    // Newest rollout files first. Only a handful are ever relevant.
+    // session_meta never changes once written, so it needs no staleness check.
+    private static let metaCache = FileCache<[String: Any]?>(immutableContent: true)
+    private static let infoCache = FileCache<Info>()
+    private static let filesCache = TimedCache<[URL]>(interval: 10)
+
+    // Newest rollout files first. Only a handful are ever relevant. The
+    // directory walk stats every rollout, so it is refreshed on an interval
+    // rather than on every 2 second tick.
     static func recentFiles(limit: Int = 40) -> [URL] {
+        Array(filesCache.value { scanFiles() }.prefix(limit))
+    }
+
+    private static func scanFiles() -> [URL] {
         let keys: [URLResourceKey] = [.contentModificationDateKey]
         guard let walker = FileManager.default.enumerator(
             at: root, includingPropertiesForKeys: keys) else { return [] }
@@ -436,12 +526,18 @@ enum Codex {
                 .contentModificationDate ?? .distantPast
             found.append((url, modified))
         }
-        return found.sorted { $0.1 > $1.1 }.prefix(limit).map(\.0)
+        // Bounded so a long history cannot grow this list without limit; the
+        // caller takes what it needs from the newest end.
+        return found.sorted { $0.1 > $1.1 }.prefix(200).map(\.0)
+    }
+
+    static func firstLine(_ url: URL) -> [String: Any]? {
+        metaCache.value(for: url) { readFirstLine($0) }
     }
 
     // The session_meta line embeds the full system prompt, so it runs to tens of
     // kilobytes; read until the newline instead of guessing a chunk size.
-    static func firstLine(_ url: URL) -> [String: Any]? {
+    private static func readFirstLine(_ url: URL) -> [String: Any]? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
         var buffer = Data()
@@ -483,12 +579,17 @@ enum Codex {
     }
 
     static func info(cwd: String, files: [URL]) -> Info {
-        var info = Info()
         guard let url = files.first(where: {
             guard let meta = firstLine($0) else { return false }
             return isMainSession(meta, cwd: cwd)
-        }) else { return info }
+        }) else { return Info() }
+        // Keyed on the rollout's mtime, so an active session re-parses and an
+        // idle one does not.
+        return infoCache.value(for: url) { parseInfo($0) }
+    }
 
+    private static func parseInfo(_ url: URL) -> Info {
+        var info = Info()
         info.name = firstLine(url)?["thread_name"] as? String
         for object in tailObjects(url).reversed() {
             guard let payload = object["payload"] as? [String: Any] else { continue }
