@@ -63,8 +63,19 @@ struct HerdrAgent: Decodable {
     let focused: Bool
 }
 
+// herdr is a third party CLI whose JSON is not a stable contract, and a
+// strict array decode would fail wholesale on one unexpected entry: every
+// Claude session would drop to the coarse status field and every Codex tile
+// would vanish. Decode per element and keep what parses.
+struct LenientAgent: Decodable {
+    let agent: HerdrAgent?
+    init(from decoder: Decoder) throws {
+        agent = try? HerdrAgent(from: decoder)
+    }
+}
+
 struct HerdrAgentList: Decodable {
-    struct Result: Decodable { let agents: [HerdrAgent] }
+    struct Result: Decodable { let agents: [LenientAgent] }
     let result: Result
 }
 
@@ -85,6 +96,37 @@ struct SessionTile: Identifiable, Equatable {
     let contextWindow: Int? // Codex reports it; Claude does not
     let host: String? // Ghostty, GoLand, WebStorm, ...
     let hostAppPath: String?
+}
+
+// MARK: - File streaming
+
+// Streams a file line by line so a transcript is never held in memory whole.
+// Transcripts reach tens of megabytes each, and mapping then decoding one into
+// a String copies every byte.
+func forEachLine(of url: URL, _ body: (String) -> Void) {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return }
+    defer { try? handle.close() }
+    var buffer = Data()
+    while let chunk = try? handle.read(upToCount: 1 << 20), !chunk.isEmpty {
+        buffer.append(chunk)
+        var start = buffer.startIndex
+        while let newline = buffer[start...].firstIndex(of: UInt8(ascii: "\n")) {
+            if newline > start {
+                body(String(decoding: buffer[start..<newline], as: UTF8.self))
+            }
+            start = buffer.index(after: newline)
+        }
+        buffer.removeSubrange(buffer.startIndex..<start)
+    }
+    if !buffer.isEmpty {
+        body(String(decoding: buffer, as: UTF8.self))
+    }
+}
+
+func parseISODate(_ text: String) -> Date? {
+    (try? Date(text, strategy: Date.ISO8601FormatStyle(
+        includingFractionalSeconds: true)))
+        ?? (try? Date(text, strategy: .iso8601))
 }
 
 // MARK: - Caching
@@ -124,6 +166,9 @@ final class FileCache<Value>: @unchecked Sendable {
 
         let fresh = compute(url)
         lock.lock()
+        // Rollout headers are ~20KB of parsed JSON each and the newest-N window
+        // rotates over days, so the map would grow for the life of the process.
+        if entries.count > 200 { entries.removeAll(keepingCapacity: true) }
         entries[url.path] = (stamp, size, fresh)
         lock.unlock()
         return fresh
@@ -159,7 +204,8 @@ final class TimedCache<Value>: @unchecked Sendable {
 // MARK: - Subprocesses
 
 @discardableResult
-func runCommand(_ path: String, _ args: [String]) -> Data {
+func runCommand(_ path: String, _ args: [String],
+                timeout: TimeInterval = 5) -> Data {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
@@ -171,27 +217,46 @@ func runCommand(_ path: String, _ args: [String]) -> Data {
     } catch {
         return Data()
     }
+    // Without this, a wedged helper parks a cooperative-pool thread forever and
+    // the 2 second refresh keeps adding more until the pool is exhausted.
+    let watchdog = DispatchWorkItem {
+        if p.isRunning { p.terminate() }
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + timeout,
+                                      execute: watchdog)
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     p.waitUntilExit()
+    watchdog.cancel()
     return data
 }
 
 // MARK: - Herdr CLI
 
 enum Herdr {
-    static let binary: String = {
+    // Known install locations first, then PATH. Process does no PATH lookup of
+    // its own, so without the env fallback anyone whose herdr lives somewhere
+    // else (/usr/bin, ~/bin, ~/go/bin, a Nix profile) got no sessions and no
+    // diagnostic. Resolved per call so installing herdr while the app runs
+    // takes effect.
+    static func resolve() -> (path: String, args: [String]) {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates = [
             home + "/.local/bin/herdr",
             "/opt/homebrew/bin/herdr",
             "/usr/local/bin/herdr",
         ]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "herdr"
-    }()
+        if let found = candidates.first(where: {
+            FileManager.default.isExecutableFile(atPath: $0)
+        }) {
+            return (found, [])
+        }
+        return ("/usr/bin/env", ["herdr"])
+    }
 
     @discardableResult
     static func run(_ args: [String]) -> Data {
-        runCommand(binary, args)
+        let tool = resolve()
+        return runCommand(tool.path, tool.args + args)
     }
 
     static func agents() -> [HerdrAgent] {
@@ -199,7 +264,7 @@ enum Herdr {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return (try? decoder.decode(HerdrAgentList.self, from: data))?
-            .result.agents ?? []
+            .result.agents.compactMap(\.agent) ?? []
     }
 
     // Claude sessions join by session id; Codex reports none.
@@ -280,9 +345,15 @@ enum Hosts {
 // MARK: - Transcript info (model, context size)
 
 enum Transcript {
-    // ~/.claude/projects/<cwd with / and . replaced by -> / <sessionId>.jsonl
+    // ~/.claude/projects/<slug>/<sessionId>.jsonl, where Claude Code replaces
+    // every character outside [A-Za-z0-9] with a dash. Replacing only "/" and
+    // "." silently missed any path with a space, an underscore or a tilde,
+    // which meant no model and no context for those sessions.
     static func path(sessionId: String, cwd: String) -> String {
-        let slug = String(cwd.map { "/.".contains($0) ? "-" : $0 })
+        let slug = String(cwd.map { character in
+            character.isASCII && (character.isLetter || character.isNumber)
+                ? character : "-"
+        })
         return FileManager.default.homeDirectoryForCurrentUser.path
             + "/.claude/projects/\(slug)/\(sessionId).jsonl"
     }
@@ -305,9 +376,11 @@ enum Transcript {
         let size = (try? fh.seekToEnd()) ?? 0
         let tailLength: UInt64 = 128 * 1024
         try? fh.seek(toOffset: size > tailLength ? size - tailLength : 0)
-        guard let data = try? fh.readToEnd(),
-              let text = String(data: data, encoding: .utf8)
-        else { return (nil, nil) }
+        // Decoding, not String(data:encoding:): a tail seek lands mid-codepoint
+        // often enough that the strict initialiser returned nil and the model
+        // and context flickered away every couple of seconds.
+        guard let data = try? fh.readToEnd() else { return (nil, nil) }
+        let text = String(decoding: data, as: UTF8.self)
 
         for line in text.split(separator: "\n").reversed() {
             guard line.contains("\"usage\""),
@@ -343,6 +416,13 @@ struct UsageLimit: Decodable, Equatable, Identifiable {
 
     var id: String { kind + (scope?.model?.displayName ?? "") }
     var agent: String { kind.hasPrefix("codex") ? "codex" : "claude" }
+
+    // Int(Double) traps on NaN, infinity, or anything past Int64, and this
+    // number arrives over the network.
+    var wholePercent: Int {
+        guard percent.isFinite else { return 0 }
+        return Int(min(max(percent, 0), 100).rounded())
+    }
 
     private var windowName: String {
         guard let minutes = windowMinutes, minutes > 0 else { return "window" }
@@ -441,34 +521,38 @@ enum Stats {
 
     static func scan(days: Int = 14) -> [Point] {
         let fm = FileManager.default
-        let cutoff = Calendar.current.date(
-            byAdding: .day, value: -(days - 1), to: Calendar.current.startOfDay(for: .now))!
+        let calendar = Calendar.current
+        let cutoff = calendar.date(
+            byAdding: .day, value: -(days - 1),
+            to: calendar.startOfDay(for: .now))!
         guard let files = fm.enumerator(
             at: projectsRoot,
             includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
 
-        var agg: [String: [String: (input: Int, output: Int)]] = [:]
+        // Keyed by local day. Bucketing on the timestamp's UTC date while
+        // cutting off at local midnight dropped the oldest bar and filed
+        // evening work under the wrong day everywhere except UTC.
+        var agg: [Date: [String: (input: Int, output: Int)]] = [:]
         for case let url as URL in files where url.pathExtension == "jsonl" {
             // A file's last write is its newest entry, so an older file cannot
             // hold anything inside the window.
             let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate
             if let modified, modified < cutoff { continue }
-            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { continue }
             autoreleasepool {
-                let text = String(decoding: data, as: UTF8.self)
-                for line in text.split(separator: "\n") {
+                forEachLine(of: url) { line in
                     guard line.contains("\"usage\""),
                           let obj = try? JSONSerialization.jsonObject(
                             with: Data(line.utf8)) as? [String: Any],
                           let timestamp = obj["timestamp"] as? String,
-                          timestamp.count >= 10,
+                          let moment = parseISODate(timestamp),
+                          moment >= cutoff,
                           let message = obj["message"] as? [String: Any],
                           let usage = message["usage"] as? [String: Any],
                           let model = message["model"] as? String,
                           !model.hasPrefix("<")
-                    else { continue }
-                    let day = String(timestamp.prefix(10))
+                    else { return }
+                    let day = calendar.startOfDay(for: moment)
                     let input = ["input_tokens", "cache_creation_input_tokens",
                                  "cache_read_input_tokens"]
                         .compactMap { usage[$0] as? Int }.reduce(0, +)
@@ -480,18 +564,13 @@ enum Stats {
             }
         }
 
-        let parser = Date.ISO8601FormatStyle(dateSeparator: .dash,
-                                             dateTimeSeparator: .space)
-        var points: [Point] = []
-        for (day, models) in agg {
-            guard let date = try? Date(day + " 00:00:00Z", strategy: parser),
-                  date >= cutoff else { continue }
-            for (model, counts) in models {
-                points.append(Point(day: date, model: model,
-                                    tokens: counts.input, output: counts.output))
+        return agg.flatMap { day, models in
+            models.map { model, counts in
+                Point(day: day, model: model,
+                      tokens: counts.input, output: counts.output)
             }
         }
-        return points.sorted { ($0.day, $0.model) < ($1.day, $1.model) }
+        .sorted { ($0.day, $0.model) < ($1.day, $1.model) }
     }
 }
 
@@ -570,8 +649,9 @@ enum Codex {
         let size = (try? handle.seekToEnd()) ?? 0
         try? handle.seek(toOffset: size > UInt64(bytes)
                          ? size - UInt64(bytes) : 0)
-        guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return [] }
+        guard let data = try? handle.readToEnd() else { return [] }
+        // See Transcript.parse: a tail seek can split a multi-byte character.
+        let text = String(decoding: data, as: UTF8.self)
         return text.split(separator: "\n").compactMap {
             try? JSONSerialization.jsonObject(with: Data($0.utf8))
                 as? [String: Any]
@@ -681,8 +761,16 @@ enum Sessions {
             guard let data = try? Data(contentsOf: file),
                   let session = try? decoder.decode(ClaudeSessionFile.self, from: data)
             else { continue }
-            // A session file can outlive its process. Keep only live pids.
-            guard kill(session.pid, 0) == 0 else { continue }
+            // A session file can outlive its process and macOS recycles pids,
+            // so the pid must still be alive AND still be a claude process.
+            // Without the identity check a recycled pid renders a ghost tile
+            // whose Kill action would signal an unrelated process. The pid > 0
+            // guard matters more: kill(0, ...) targets our own process group.
+            guard session.pid > 0,
+                  let process = processes[session.pid],
+                  (process.comm as NSString).lastPathComponent
+                    .contains("claude")
+            else { continue }
 
             let agent = herdr[session.sessionId]
             let status = agent?.agentStatus
@@ -758,6 +846,8 @@ final class Model: ObservableObject {
     }
     private var timer: Timer?
     private var usageTimer: Timer?
+    // The 2 second timer fires whether or not the previous scan finished.
+    private var refreshing = false
     // Session ids that finished work: went working -> idle and were not clicked yet.
     private var doneIds: Set<String> = []
 
@@ -802,7 +892,7 @@ final class Model: ObservableObject {
             guard !UserDefaults.standard.bool(forKey: key) else { continue }
             UserDefaults.standard.set(true, forKey: key)
             let content = UNMutableNotificationContent()
-            content.title = "Claude usage at \(Int(limit.percent))%"
+            content.title = "\(limit.agent.capitalized) usage at \(limit.wholePercent)%"
             content.body = limit.label + (limit.resetsAt.map {
                 ", resets \($0.formatted(.relative(presentation: .named)))" } ?? "")
             content.sound = .default
@@ -812,10 +902,14 @@ final class Model: ObservableObject {
     }
 
     nonisolated func refresh() {
-        Task.detached(priority: .utility) {
-            let loaded = Sessions.load()
-            await MainActor.run { [weak self] in
-                guard let self else { return }
+        Task { @MainActor [weak self] in
+            guard let self, !self.refreshing else { return }
+            self.refreshing = true
+            defer { self.refreshing = false }
+            let loaded = await Task.detached(priority: .utility) {
+                Sessions.load()
+            }.value
+            do {
                 let previous = Dictionary(
                     uniqueKeysWithValues: self.tiles.map { ($0.id, $0.status) })
                 var tiles: [SessionTile] = []
@@ -841,7 +935,9 @@ final class Model: ObservableObject {
     }
 
     nonisolated func terminate(_ tile: SessionTile) {
-        guard let pid = tile.pid else { return }
+        // A non-positive pid would signal our own process group, or every
+        // process this user can signal.
+        guard let pid = tile.pid, pid > 0 else { return }
         Darwin.kill(pid, SIGTERM)
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(700))
@@ -1743,7 +1839,7 @@ struct UsageGauge: View {
                         .foregroundStyle(color)
                         .frame(width: 11, height: 11)
                 }
-                Text("\(Int(limit.percent))%")
+                Text("\(limit.wholePercent)%")
                     .font(.system(size: 12, weight: .bold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(color)
@@ -1822,7 +1918,7 @@ struct UsagePanel: View {
                     .foregroundStyle(color)
                     .frame(width: 8, height: 8)
             }
-            Text("\(Int(limit.percent))%")
+            Text("\(limit.wholePercent)%")
                 .font(.system(size: 9.5, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .foregroundStyle(color)
@@ -2260,7 +2356,7 @@ struct HivemindApp: App {
                     Codex.planLimits(files: Codex.recentFiles(limit: 8)))
                 for limit in limits {
                     print("usage\t\(limit.agent)\t\(limit.label)"
-                          + "\t\(Int(limit.percent))%\t"
+                          + "\t\(limit.wholePercent)%\t"
                           + (limit.resetsAt?.formatted() ?? "-"))
                 }
                 semaphore.signal()

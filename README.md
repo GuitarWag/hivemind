@@ -96,6 +96,12 @@ herdr integration install codex
 That installs the state hook herdr reads. Without it, `herdr agent list` reports no Codex agents
 and the Codex tab never appears.
 
+Two Codex caveats, both because the herdr Codex integration reports no session id:
+
+- Rollouts are matched to a session by working directory, so two Codex sessions running in the
+  same directory show the same model, context and title.
+- Codex reports no pid either, so those tiles have no Kill action. Focus still works.
+
 ### Plans, limits and API keys
 
 Codex plan usage is read from whatever its rollout files report: a primary window and an optional
@@ -138,7 +144,14 @@ Worth knowing before you run someone else's monitoring app:
 - It reads your Claude Code OAuth token from the keychain item `Claude Code-credentials` and sends
   it to `https://api.anthropic.com/api/oauth/usage`, and nowhere else. That is the same endpoint and
   the same token Claude Code itself uses for `/usage`. The token is never written to disk, never
-  logged, and never printed by `--dump`.
+  logged, and never printed by `--dump`. Two things worth understanding before you approve the
+  keychain prompt:
+  - The read goes through `/usr/bin/security`, so approving **Always Allow** grants access to that
+    binary, not to Hivemind. Afterwards any process running as you can read the same token with the
+    same command and no prompt. Choose **Allow** rather than Always Allow if that matters to you;
+    this app cannot undo the grant afterwards.
+  - `URLSession` honours system proxy settings, so on a machine with an intercepting proxy the
+    bearer token traverses it like any other HTTPS request.
 - No other network request is made. Session names, folders, prompts and transcript content stay on
   your machine.
 - It shells out to `herdr` for the session list and to `ps` for process ancestry.

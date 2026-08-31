@@ -6,7 +6,10 @@ cd "$(dirname "$0")"
 APP="Hivemind.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/icons"
 
-swiftc -O -parse-as-library App.swift -o "$APP/Contents/MacOS/Hivemind"
+# -swift-version 6: strict concurrency checking, so data races are compile
+# errors rather than something to discover at runtime.
+swiftc -O -parse-as-library -swift-version 6 App.swift \
+    -o "$APP/Contents/MacOS/Hivemind"
 cp icons/*.svg "$APP/Contents/Resources/icons/"
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
