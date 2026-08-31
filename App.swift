@@ -853,6 +853,39 @@ struct CountCapsule: View {
     }
 }
 
+// Picker only takes Text/Image labels and drops modifiers on them, which let
+// the 256pt native SVG render full size. Plain buttons respect the frame.
+struct ViewModeToggle: View {
+    @Binding var mode: ViewMode
+
+    var body: some View {
+        GlassEffectContainer(spacing: 4) {
+            HStack(spacing: 4) {
+                button(.orbs, Ph.hexagonBold)
+                button(.table, Ph.listDashesBold)
+            }
+        }
+    }
+
+    private func button(_ target: ViewMode, _ icon: Image) -> some View {
+        let selected = mode == target
+        return Button {
+            mode = target
+        } label: {
+            icon
+                .scaledToFit()
+                .foregroundStyle(selected ? AnyShapeStyle(Color.accentColor)
+                                          : AnyShapeStyle(.secondary))
+                .frame(width: 14, height: 14)
+                .padding(7)
+        }
+        .buttonStyle(.plain)
+        .glassEffect(
+            .regular.tint(Color.accentColor.opacity(selected ? 0.28 : 0)),
+            in: .capsule)
+    }
+}
+
 struct HeaderView: View {
     let tiles: [SessionTile]
     @Binding var mode: ViewMode
@@ -873,15 +906,7 @@ struct HeaderView: View {
                     }
                 }
             }
-            Picker("View", selection: $mode) {
-                Ph.hexagonBold.scaledToFit().frame(width: 14, height: 14)
-                    .tag(ViewMode.orbs)
-                Ph.listDashesBold.scaledToFit().frame(width: 14, height: 14)
-                    .tag(ViewMode.table)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(width: 88)
+            ViewModeToggle(mode: $mode)
         }
         .padding(.horizontal, 22)
         .padding(.top, 34) // keep clear of the traffic lights
