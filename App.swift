@@ -1163,7 +1163,7 @@ struct HeaderView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Text("Claude Sessions")
+            Text("Hivemind")
                 .font(.system(size: 20, weight: .bold, design: .rounded))
             Spacer()
             GlassEffectContainer(spacing: 8) {
@@ -1666,7 +1666,7 @@ struct ContentView: View {
 }
 
 @main
-struct ClaudeSessionsApp: App {
+struct HivemindApp: App {
     @StateObject private var model: Model
 
     init() {
@@ -1748,7 +1748,7 @@ struct ClaudeSessionsApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("Claude Sessions") {
+        WindowGroup("Hivemind") {
             ContentView().environmentObject(model)
         }
         .windowStyle(.hiddenTitleBar)
