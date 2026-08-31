@@ -1,3 +1,4 @@
+import Charts
 import SwiftUI
 import UserNotifications
 
@@ -14,10 +15,12 @@ enum Ph {
     static let hexagonBold = load("hexagon-bold")
     static let listDashesBold = load("list-dashes-bold")
     static let moonStarsDuotone = load("moon-stars-duotone")
+    static let chartBarBold = load("chart-bar-bold")
 
     static let names = [
         "lightning-fill", "moon-fill", "warning-fill", "check-circle-fill",
         "question-fill", "hexagon-bold", "list-dashes-bold", "moon-stars-duotone",
+        "chart-bar-bold",
     ]
 
     static func url(_ name: String) -> URL? {
@@ -288,6 +291,87 @@ enum Usage {
     }
 }
 
+// MARK: - Historical stats (from local transcripts)
+
+// The account endpoint reports only current utilization, with no history and
+// no per-model token counts, so daily charts come from the transcript files.
+// These are raw tokens: the plan's percentages are weighted per model and the
+// weights are not published, so the two numbers do not convert into each other.
+enum Stats {
+    struct Point: Identifiable, Equatable {
+        let day: Date
+        let model: String
+        let tokens: Int
+        let output: Int
+        var id: String { "\(day.timeIntervalSince1970)-\(model)" }
+    }
+
+    static let projectsRoot = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".claude/projects")
+
+    static func prettyModel(_ model: String) -> String {
+        model.replacingOccurrences(of: "claude-", with: "")
+            .split(separator: "-")
+            .map { $0.first!.uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+
+    static func scan(days: Int = 14) -> [Point] {
+        let fm = FileManager.default
+        let cutoff = Calendar.current.date(
+            byAdding: .day, value: -(days - 1), to: Calendar.current.startOfDay(for: .now))!
+        guard let files = fm.enumerator(
+            at: projectsRoot,
+            includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
+
+        var agg: [String: [String: (input: Int, output: Int)]] = [:]
+        for case let url as URL in files where url.pathExtension == "jsonl" {
+            // A file's last write is its newest entry, so an older file cannot
+            // hold anything inside the window.
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            if let modified, modified < cutoff { continue }
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { continue }
+            autoreleasepool {
+                let text = String(decoding: data, as: UTF8.self)
+                for line in text.split(separator: "\n") {
+                    guard line.contains("\"usage\""),
+                          let obj = try? JSONSerialization.jsonObject(
+                            with: Data(line.utf8)) as? [String: Any],
+                          let timestamp = obj["timestamp"] as? String,
+                          timestamp.count >= 10,
+                          let message = obj["message"] as? [String: Any],
+                          let usage = message["usage"] as? [String: Any],
+                          let model = message["model"] as? String,
+                          !model.hasPrefix("<")
+                    else { continue }
+                    let day = String(timestamp.prefix(10))
+                    let input = ["input_tokens", "cache_creation_input_tokens",
+                                 "cache_read_input_tokens"]
+                        .compactMap { usage[$0] as? Int }.reduce(0, +)
+                    let output = usage["output_tokens"] as? Int ?? 0
+                    let previous = agg[day]?[model] ?? (0, 0)
+                    agg[day, default: [:]][model] =
+                        (previous.input + input, previous.output + output)
+                }
+            }
+        }
+
+        let parser = Date.ISO8601FormatStyle(dateSeparator: .dash,
+                                             dateTimeSeparator: .space)
+        var points: [Point] = []
+        for (day, models) in agg {
+            guard let date = try? Date(day + " 00:00:00Z", strategy: parser),
+                  date >= cutoff else { continue }
+            for (model, counts) in models {
+                points.append(Point(day: date, model: model,
+                                    tokens: counts.input, output: counts.output))
+            }
+        }
+        return points.sorted { ($0.day, $0.model) < ($1.day, $1.model) }
+    }
+}
+
 // MARK: - Session loading
 
 enum Sessions {
@@ -464,7 +548,9 @@ func statusColor(_ status: String) -> Color {
 }
 
 func formatTokens(_ n: Int) -> String {
-    n >= 1000 ? String(format: "%.0fk", Double(n) / 1000) : "\(n)"
+    if n >= 1_000_000 { return String(format: "%.1fM", Double(n) / 1_000_000) }
+    if n >= 1000 { return String(format: "%.0fk", Double(n) / 1000) }
+    return "\(n)"
 }
 
 enum ViewMode: String, CaseIterable, Identifiable {
@@ -1024,16 +1110,170 @@ struct UsageGauge: View {
 
 struct UsagePanel: View {
     let limits: [UsageLimit]
+    let open: () -> Void
+    @State private var hovered = false
 
     var body: some View {
-        HStack(spacing: 22) {
-            ForEach(limits) { UsageGauge(limit: $0) }
+        Button(action: open) {
+            HStack(spacing: 22) {
+                ForEach(limits) { UsageGauge(limit: $0) }
+                Ph.chartBarBold
+                    .scaledToFit()
+                    .foregroundStyle(hovered ? AnyShapeStyle(.primary)
+                                             : AnyShapeStyle(.tertiary))
+                    .frame(width: 15, height: 15)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .glassEffect(.regular, in: .rect(cornerRadius: 18))
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .help("Open usage stats")
         .padding(.horizontal, 22)
         .padding(.bottom, 14)
+    }
+}
+
+struct StatsView: View {
+    let limits: [UsageLimit]
+    @Environment(\.dismiss) private var dismiss
+    @State private var points: [Stats.Point]?
+
+    private var models: [String] {
+        Array(Set((points ?? []).map(\.model))).sorted()
+    }
+
+    private var weekTotals: [(model: String, tokens: Int, output: Int)] {
+        let cutoff = Calendar.current.date(byAdding: .day, value: -6,
+                                           to: Calendar.current.startOfDay(for: .now))!
+        var totals: [String: (Int, Int)] = [:]
+        for point in (points ?? []) where point.day >= cutoff {
+            let previous = totals[point.model] ?? (0, 0)
+            totals[point.model] = (previous.0 + point.tokens, previous.1 + point.output)
+        }
+        return totals.map { (Stats.prettyModel($0.key), $0.value.0, $0.value.1) }
+            .sorted { $0.1 > $1.1 }
+    }
+
+    var body: some View {
+        ZStack {
+            MeshBackground()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    header
+                    if !limits.isEmpty {
+                        card("Plan limits, live from your account") {
+                            HStack(alignment: .top, spacing: 24) {
+                                ForEach(limits) { UsageGauge(limit: $0) }
+                            }
+                        }
+                    }
+                    card("Tokens per day by model, last 14 days") {
+                        if let points, !points.isEmpty {
+                            chart(points)
+                        } else if points == nil {
+                            ProgressView().frame(height: 200)
+                                .frame(maxWidth: .infinity)
+                        } else {
+                            Text("No transcript data in the last 14 days")
+                                .foregroundStyle(.secondary)
+                                .frame(height: 200)
+                        }
+                    }
+                    card("Last 7 days by model") {
+                        Grid(alignment: .leading, horizontalSpacing: 20,
+                             verticalSpacing: 8) {
+                            GridRow {
+                                Text("Model").gridColumnAlignment(.leading)
+                                Text("Input + cache").gridColumnAlignment(.trailing)
+                                Text("Output").gridColumnAlignment(.trailing)
+                            }
+                            .font(.system(size: 11, weight: .semibold,
+                                          design: .rounded))
+                            .foregroundStyle(.secondary)
+                            Divider()
+                            ForEach(weekTotals, id: \.model) { row in
+                                GridRow {
+                                    Text(row.model).fontWeight(.semibold)
+                                    Text(formatTokens(row.tokens)).monospacedDigit()
+                                    Text(formatTokens(row.output)).monospacedDigit()
+                                }
+                                .font(.system(size: 12, design: .rounded))
+                            }
+                        }
+                    }
+                    Text("Daily figures are counted from local transcripts. The "
+                         + "plan percentages above are weighted per model by "
+                         + "Anthropic, so raw tokens do not convert into them.")
+                        .font(.system(size: 10, design: .rounded))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 4)
+                }
+                .padding(22)
+            }
+        }
+        .frame(minWidth: 620, minHeight: 560)
+        .task {
+            let scanned = await Task.detached(priority: .userInitiated) {
+                Stats.scan()
+            }.value
+            points = scanned
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            Text("Usage Stats")
+                .font(.system(size: 22, weight: .bold, design: .rounded))
+            Spacer()
+            Button("Done") { dismiss() }
+                .buttonStyle(.glass)
+        }
+    }
+
+    private func chart(_ points: [Stats.Point]) -> some View {
+        Chart(points) { point in
+            BarMark(
+                x: .value("Day", point.day, unit: .day),
+                y: .value("Tokens", point.tokens)
+            )
+            .foregroundStyle(by: .value("Model", Stats.prettyModel(point.model)))
+            .cornerRadius(3)
+        }
+        .chartYAxis {
+            AxisMarks { value in
+                AxisGridLine()
+                AxisValueLabel {
+                    if let tokens = value.as(Int.self) {
+                        Text(formatTokens(tokens))
+                    }
+                }
+            }
+        }
+        .chartXAxis {
+            AxisMarks(values: .stride(by: .day, count: 2)) { _ in
+                AxisGridLine()
+                AxisValueLabel(format: .dateTime.day().month(.abbreviated))
+            }
+        }
+        .chartLegend(position: .bottom, spacing: 12)
+        .frame(height: 240)
+    }
+
+    @ViewBuilder
+    private func card<Content: View>(
+        _ title: String, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+            content()
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassEffect(.regular, in: .rect(cornerRadius: 20))
     }
 }
 
@@ -1060,6 +1300,7 @@ struct ContentView: View {
     @AppStorage("viewMode") private var mode: ViewMode = .orbs
     @State private var killTarget: SessionTile?
     @State private var confirmKill = false
+    @State private var showStats = false
     private let diameter: CGFloat = 176
 
     var body: some View {
@@ -1091,7 +1332,7 @@ struct ContentView: View {
                     }
                 }
                 if !model.usageLimits.isEmpty {
-                    UsagePanel(limits: model.usageLimits)
+                    UsagePanel(limits: model.usageLimits) { showStats = true }
                 }
             }
         }
@@ -1107,6 +1348,9 @@ struct ContentView: View {
             }
         } message: { tile in
             Text("Sends SIGTERM to the claude process in \(tile.dir).")
+        }
+        .sheet(isPresented: $showStats) {
+            StatsView(limits: model.usageLimits)
         }
     }
 
@@ -1139,6 +1383,13 @@ struct ClaudeSessionsApp: App {
             print("icons ok; \(Ph.names.count) phosphor svgs load")
             print("honeycomb layout ok; 7 ->",
                   layout.rowLengths(7, maxCols: 6).map(String.init).joined(separator: ","))
+            let points = Stats.scan()
+            var byDay: [Date: Int] = [:]
+            for point in points { byDay[point.day, default: 0] += point.tokens }
+            for (day, tokens) in byDay.sorted(by: { $0.key < $1.key }).suffix(4) {
+                print("stats\t\(day.formatted(date: .numeric, time: .omitted))"
+                      + "\t\(formatTokens(tokens))")
+            }
             let semaphore = DispatchSemaphore(value: 0)
             // detached: init runs on the MainActor, and a plain Task would
             // inherit it and deadlock against semaphore.wait() below
