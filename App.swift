@@ -1281,47 +1281,74 @@ struct UsagePanel: View {
     let open: () -> Void
     @State private var hovered = false
 
+    @State private var expanded = false
+
     var body: some View {
         Button(action: open) {
-            VStack(alignment: .leading, spacing: 5) {
-                ForEach(limits) { limit in
-                    let color = usageColor(limit.percent)
+            VStack(alignment: .leading, spacing: expanded ? 11 : 5) {
+                if expanded {
+                    ForEach(limits) { UsageGauge(limit: $0) }
+                    Divider()
                     HStack(spacing: 6) {
-                        Text(limit.shortLabel)
-                            .font(.system(size: 9.5, weight: .semibold,
+                        Ph.chartBarBold.scaledToFit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 11, height: 11)
+                        Text("Open usage stats")
+                            .font(.system(size: 11, weight: .semibold,
                                           design: .rounded))
                             .foregroundStyle(.secondary)
-                            .frame(width: 38, alignment: .leading)
-                            .lineLimit(1)
-                        Capsule().fill(.quaternary)
-                            .frame(width: 44, height: 4)
-                            .overlay(alignment: .leading) {
-                                Capsule().fill(color.gradient)
-                                    .frame(width: 44 * min(1, limit.percent / 100),
-                                           height: 4)
-                            }
-                        if limit.percent >= 80 {
-                            Ph.warningFill.scaledToFit()
-                                .foregroundStyle(color)
-                                .frame(width: 8, height: 8)
-                        }
-                        Text("\(Int(limit.percent))%")
-                            .font(.system(size: 9.5, weight: .bold,
-                                          design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(color)
-                            .frame(width: 26, alignment: .trailing)
                     }
+                } else {
+                    ForEach(limits) { compactRow($0) }
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 12))
+            .padding(expanded ? 14 : 10)
+            .frame(width: expanded ? 236 : nil, alignment: .leading)
+            .glassEffect(.regular.interactive(),
+                         in: .rect(cornerRadius: expanded ? 18 : 12))
             .opacity(hovered ? 1 : 0.82)
         }
         .buttonStyle(.plain)
-        .onHover { hovered = $0 }
+        .onHover { over in
+            hovered = over
+            if !over { expanded = false }
+        }
+        .task(id: hovered) {
+            guard hovered else { return }
+            try? await Task.sleep(for: .milliseconds(120))
+            if hovered { expanded = true }
+        }
+        // One-shot spring on hover, not a repeating animation, so it does not
+        // hit the glass recomposition cost.
+        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: expanded)
         .help("Open usage stats")
+    }
+
+    private func compactRow(_ limit: UsageLimit) -> some View {
+        let color = usageColor(limit.percent)
+        return HStack(spacing: 6) {
+            Text(limit.shortLabel)
+                .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                .foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .leading)
+                .lineLimit(1)
+            Capsule().fill(.quaternary)
+                .frame(width: 44, height: 4)
+                .overlay(alignment: .leading) {
+                    Capsule().fill(color.gradient)
+                        .frame(width: 44 * min(1, limit.percent / 100), height: 4)
+                }
+            if limit.percent >= 80 {
+                Ph.warningFill.scaledToFit()
+                    .foregroundStyle(color)
+                    .frame(width: 8, height: 8)
+            }
+            Text("\(Int(limit.percent))%")
+                .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(color)
+                .frame(width: 26, alignment: .trailing)
+        }
     }
 }
 
