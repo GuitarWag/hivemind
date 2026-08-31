@@ -250,6 +250,15 @@ struct UsageLimit: Decodable, Equatable, Identifiable {
         default: return kind.replacingOccurrences(of: "_", with: " ")
         }
     }
+
+    var shortLabel: String {
+        switch kind {
+        case "session": return "5h"
+        case "weekly_all": return "7d"
+        case "weekly_scoped": return scope?.model?.displayName ?? "model"
+        default: return kind.replacingOccurrences(of: "_", with: " ")
+        }
+    }
 }
 
 enum Usage {
@@ -444,7 +453,10 @@ final class Model: ObservableObject {
         UNUserNotificationCenter.current()
             .requestAuthorization(options: [.alert, .sound]) { _, _ in }
         refreshUsage()
-        usageTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) {
+        // 5 minutes: the endpoint rate-limits (429) well before utilization
+        // percentages change meaningfully. A failed fetch keeps the last
+        // values rather than blanking the panel.
+        usageTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) {
             [weak self] _ in self?.refreshUsage()
         }
     }
@@ -1222,14 +1234,16 @@ struct SessionTableView: View {
     }
 }
 
+func usageColor(_ percent: Double) -> Color {
+    if percent >= 95 { return .red }
+    if percent >= 80 { return .orange }
+    return .green
+}
+
 struct UsageGauge: View {
     let limit: UsageLimit
 
-    private var color: Color {
-        if limit.percent >= 95 { return .red }
-        if limit.percent >= 80 { return .orange }
-        return .green
-    }
+    private var color: Color { usageColor(limit.percent) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1261,6 +1275,7 @@ struct UsageGauge: View {
     }
 }
 
+// Compact corner widget. The full gauges live on the stats page it opens.
 struct UsagePanel: View {
     let limits: [UsageLimit]
     let open: () -> Void
@@ -1268,23 +1283,45 @@ struct UsagePanel: View {
 
     var body: some View {
         Button(action: open) {
-            HStack(spacing: 22) {
-                ForEach(limits) { UsageGauge(limit: $0) }
-                Ph.chartBarBold
-                    .scaledToFit()
-                    .foregroundStyle(hovered ? AnyShapeStyle(.primary)
-                                             : AnyShapeStyle(.tertiary))
-                    .frame(width: 15, height: 15)
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(limits) { limit in
+                    let color = usageColor(limit.percent)
+                    HStack(spacing: 6) {
+                        Text(limit.shortLabel)
+                            .font(.system(size: 9.5, weight: .semibold,
+                                          design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 38, alignment: .leading)
+                            .lineLimit(1)
+                        Capsule().fill(.quaternary)
+                            .frame(width: 44, height: 4)
+                            .overlay(alignment: .leading) {
+                                Capsule().fill(color.gradient)
+                                    .frame(width: 44 * min(1, limit.percent / 100),
+                                           height: 4)
+                            }
+                        if limit.percent >= 80 {
+                            Ph.warningFill.scaledToFit()
+                                .foregroundStyle(color)
+                                .frame(width: 8, height: 8)
+                        }
+                        Text("\(Int(limit.percent))%")
+                            .font(.system(size: 9.5, weight: .bold,
+                                          design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(color)
+                            .frame(width: 26, alignment: .trailing)
+                    }
+                }
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 12)
-            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 18))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 12))
+            .opacity(hovered ? 1 : 0.82)
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 }
         .help("Open usage stats")
-        .padding(.horizontal, 22)
-        .padding(.bottom, 14)
     }
 }
 
@@ -1466,16 +1503,21 @@ struct ContentView: View {
             MeshBackground()
             VStack(spacing: 0) {
                 HeaderView(tiles: model.tiles, mode: $mode)
-                if model.tiles.isEmpty {
-                    EmptyStateView()
-                } else if mode == .table {
-                    SessionTableView(tiles: model.tiles, focus: model.focus,
-                                     requestKill: requestKill)
-                } else {
-                    comb
+                Group {
+                    if model.tiles.isEmpty {
+                        EmptyStateView()
+                    } else if mode == .table {
+                        SessionTableView(tiles: model.tiles, focus: model.focus,
+                                         requestKill: requestKill)
+                    } else {
+                        comb
+                    }
                 }
-                if !model.usageLimits.isEmpty {
-                    UsagePanel(limits: model.usageLimits) { showStats = true }
+                .overlay(alignment: .bottomLeading) {
+                    if !model.usageLimits.isEmpty {
+                        UsagePanel(limits: model.usageLimits) { showStats = true }
+                            .padding(14)
+                    }
                 }
             }
         }
