@@ -16,11 +16,14 @@ enum Ph {
     static let listDashesBold = load("list-dashes-bold")
     static let moonStarsDuotone = load("moon-stars-duotone")
     static let chartBarBold = load("chart-bar-bold")
+    static let minusBold = load("minus-bold")
+    static let plusBold = load("plus-bold")
+    static let cornersOutBold = load("corners-out-bold")
 
     static let names = [
         "lightning-fill", "moon-fill", "warning-fill", "check-circle-fill",
         "question-fill", "hexagon-bold", "list-dashes-bold", "moon-stars-duotone",
-        "chart-bar-bold",
+        "chart-bar-bold", "minus-bold", "plus-bold", "corners-out-bold",
     ]
 
     static func url(_ name: String) -> URL? {
@@ -610,26 +613,11 @@ struct MeshBackground: View {
     }
 }
 
-// ponytail: any repeating SwiftUI animation under glassEffect recomposites the
-// whole window (~10-15% CPU). A periodic short fade keeps the redraw duty
-// cycle low. Re-check if glass compositing gets cheaper in a later macOS.
-struct WorkingBlink: ViewModifier {
-    let active: Bool
-
-    func body(content: Content) -> some View {
-        if active {
-            TimelineView(.periodic(from: .now, by: 1.2)) { context in
-                let on = Int(
-                    context.date.timeIntervalSinceReferenceDate / 1.2) % 2 == 0
-                content
-                    .opacity(on ? 1 : 0.45)
-                    .animation(.easeInOut(duration: 0.35), value: on)
-            }
-        } else {
-            content
-        }
-    }
-}
+// ponytail: there is deliberately no animated "working" pulse. Every repeating
+// animation under glassEffect recomposites the whole window: a 0.35s fade every
+// 1.2s measured 12-21% CPU on a scrollable comb, versus 0-1.5% without it.
+// Working sessions are marked statically instead (tint, bolt icon, brighter
+// rim). Revisit only if glass compositing gets cheaper in a later macOS.
 
 // Pointy-top regular hexagon with rounded corners.
 struct Hexagon: Shape {
@@ -671,6 +659,13 @@ struct Hexagon: Shape {
 struct HoneycombLayout: Layout {
     var cellWidth: CGFloat
     var spacing: CGFloat = 16
+    // The caller fixes the row shape from the unzoomed size, so zooming
+    // magnifies the comb instead of reflowing it into a different cluster.
+    var maxCols: Int = 6
+    // Viewport width, used to centre a comb narrower than the window. The
+    // layout cannot read it from the proposal: inside a two-axis ScrollView
+    // the proposed width is unbounded.
+    var containerWidth: CGFloat = 0
 
     // Balanced comb: every row is centered, so hex packing holds only when
     // adjacent row lengths differ by an odd number (that difference is what
@@ -720,18 +715,19 @@ struct HoneycombLayout: Layout {
         return best
     }
 
-    private func positions(count: Int, width: CGFloat)
-        -> (points: [CGPoint], size: CGSize) {
+    // Also drives the minimap, so both read the comb from one source.
+    func positions(count: Int) -> (points: [CGPoint], size: CGSize) {
         let w = cellWidth + spacing
         let cellHeight = cellWidth * 2 / sqrt(3)
         let rowPitch = cellHeight * 0.75 + spacing * 0.85
-        let capacity = max(1, Int((width + spacing) / w))
-        let rows = rowLengths(count, maxCols: capacity)
+        let rows = rowLengths(count, maxCols: maxCols)
+        let contentWidth = max(0, CGFloat(rows.max() ?? 0) * w - spacing)
+        let layoutWidth = max(contentWidth, containerWidth)
 
         var points: [CGPoint] = []
         for (rowIndex, length) in rows.enumerated() {
             let span = CGFloat(length) * w - spacing
-            let startX = (width - span) / 2 + cellWidth / 2
+            let startX = (layoutWidth - span) / 2 + cellWidth / 2
             for i in 0..<length {
                 points.append(CGPoint(
                     x: startX + CGFloat(i) * w,
@@ -740,22 +736,74 @@ struct HoneycombLayout: Layout {
         }
         let height = rows.isEmpty
             ? 0 : CGFloat(rows.count - 1) * rowPitch + cellHeight
-        return (points, CGSize(width: width, height: height))
+        return (points, CGSize(width: layoutWidth, height: height))
     }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews,
                       cache: inout ()) -> CGSize {
-        positions(count: subviews.count, width: proposal.width ?? 600).size
+        positions(count: subviews.count).size
     }
 
     func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize,
                        subviews: Subviews, cache: inout ()) {
-        let result = positions(count: subviews.count, width: bounds.width)
+        let result = positions(count: subviews.count)
         for (subview, point) in zip(subviews, result.points) {
             subview.place(
                 at: CGPoint(x: bounds.minX + point.x, y: bounds.minY + point.y),
                 anchor: .center, proposal: .unspecified)
         }
+    }
+}
+
+// MARK: - Comb sizing
+
+enum Comb {
+    static let baseCell: CGFloat = 176
+    static let baseSpacing: CGFloat = 16
+    static let padding: CGFloat = 20
+    // The floor is low enough that fit can still fit a large comb into a short
+    // window; at that size the comb reads as a map and you zoom back in.
+    static let zoomRange: ClosedRange<Double> = 0.2...2.5
+    static let fitCeiling: Double = 1.6
+
+    // Columns the window can hold at unzoomed size. Fixing the shape here keeps
+    // it stable while zooming. Before the first geometry callback the viewport
+    // is zero, which would collapse the comb into one column, so assume a
+    // typical window until the real width arrives.
+    static func maxCols(viewportWidth: CGFloat) -> Int {
+        let width = viewportWidth > 1 ? viewportWidth : 900
+        return max(1, Int((width + baseSpacing) / (baseCell + baseSpacing)))
+    }
+
+    static func layout(count: Int, zoom: Double, viewport: CGSize)
+        -> HoneycombLayout {
+        HoneycombLayout(
+            cellWidth: baseCell * zoom, spacing: baseSpacing * zoom,
+            maxCols: maxCols(viewportWidth: viewport.width),
+            containerWidth: max(0, viewport.width - padding * 2))
+    }
+
+    // Comb size with no centring slack, i.e. the space the hexes really need.
+    static func contentSize(count: Int, zoom: Double,
+                            viewportWidth: CGFloat) -> CGSize {
+        HoneycombLayout(cellWidth: baseCell * zoom, spacing: baseSpacing * zoom,
+                        maxCols: maxCols(viewportWidth: viewportWidth),
+                        containerWidth: 0)
+            .positions(count: count).size
+    }
+
+    // Row shape is fixed, so content size scales linearly with zoom and the
+    // fitting zoom is exact arithmetic rather than a search.
+    static func fitZoom(count: Int, viewport: CGSize) -> Double {
+        let free = CGSize(width: viewport.width - padding * 2,
+                          height: viewport.height - padding * 2)
+        guard count > 0, free.width > 1, free.height > 1 else { return 1 }
+        let size = contentSize(count: count, zoom: 1,
+                               viewportWidth: viewport.width)
+        guard size.width > 1, size.height > 1 else { return 1 }
+        let fit = min(Double(free.width / size.width),
+                      Double(free.height / size.height))
+        return min(max(fit, Comb.zoomRange.lowerBound), fitCeiling)
     }
 }
 
@@ -776,6 +824,14 @@ struct SessionOrb: View {
     @State private var hovered = false
     @State private var showCard = false
 
+    // Working sessions carry a brighter rim, which is what the removed pulse
+    // used to signal, at no rendering cost.
+    private var rim: (top: Double, bottom: Double, width: CGFloat) {
+        if tile.focused { return (0.9, 0.5, 2.5) }
+        if tile.status == "working" { return (0.8, 0.3, 2) }
+        return (0.45, 0.08, 1)
+    }
+
     var body: some View {
         let color = statusColor(tile.status)
         Button { focus(tile) } label: {
@@ -785,7 +841,6 @@ struct SessionOrb: View {
                         .scaledToFit()
                         .foregroundStyle(color.gradient)
                         .frame(width: diameter * 0.19, height: diameter * 0.19)
-                        .modifier(WorkingBlink(active: tile.status == "working"))
                     Text(tile.name)
                         .font(.system(size: diameter * 0.105, weight: .bold,
                                       design: .rounded))
@@ -813,25 +868,25 @@ struct SessionOrb: View {
                 .frame(width: diameter, height: diameter * 2 / sqrt(3))
                 .glassEffect(
                     .regular.tint(color.opacity(0.30)).interactive(),
-                    in: Hexagon())
+                    in: Hexagon(cornerRadius: diameter * 0.08))
                 .overlay(
-                    Hexagon().fill(color.opacity(hovered ? 0.14 : 0))
+                    Hexagon(cornerRadius: diameter * 0.08)
+                        .fill(color.opacity(hovered ? 0.14 : 0))
                         .allowsHitTesting(false)
                 )
                 .overlay(
-                    Hexagon().stroke(
+                    Hexagon(cornerRadius: diameter * 0.08).stroke(
                         LinearGradient(
-                            colors: [color.opacity(tile.focused ? 0.9 : 0.45),
-                                     color.opacity(tile.focused ? 0.5 : 0.08)],
+                            colors: [color.opacity(rim.top), color.opacity(rim.bottom)],
                             startPoint: .topLeading, endPoint: .bottomTrailing),
-                        lineWidth: tile.focused ? 2.5 : 1)
+                        lineWidth: rim.width)
                 )
                 .shadow(color: color.opacity(hovered ? 0.45 : 0.22),
                         radius: hovered ? diameter * 0.14 : diameter * 0.07,
                         y: diameter * 0.03)
                 .scaleEffect(hovered ? 1.06 : 1)
             }
-            .contentShape(Hexagon())
+            .contentShape(Hexagon(cornerRadius: diameter * 0.08))
         }
         .buttonStyle(OrbButtonStyle())
         .contextMenu {
@@ -955,6 +1010,104 @@ struct CountCapsule: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .glassEffect(.regular.tint(color.opacity(0.18)), in: .capsule)
+    }
+}
+
+struct ZoomControls: View {
+    @Binding var zoom: Double
+    let fit: () -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            button(Ph.minusBold, "Zoom out", .command, "-") {
+                zoom = max(zoom / 1.25, Comb.zoomRange.lowerBound)
+            }
+            Button {
+                withAnimation(.spring(duration: 0.35)) { zoom = 1 }
+            } label: {
+                Text("\(Int((zoom * 100).rounded()))%")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .frame(width: 40)
+            }
+            .buttonStyle(.plain)
+            .help("Reset to 100%")
+            button(Ph.plusBold, "Zoom in", .command, "=") {
+                zoom = min(zoom * 1.25, Comb.zoomRange.upperBound)
+            }
+            Divider().frame(height: 14).padding(.horizontal, 2)
+            button(Ph.cornersOutBold, "Fit to view", .command, "0", action: fit)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .glassEffect(.regular, in: .capsule)
+    }
+
+    private func button(_ icon: Image, _ label: String,
+                        _ modifiers: EventModifiers, _ key: KeyEquivalent,
+                        action: @escaping () -> Void) -> some View {
+        Button {
+            withAnimation(.spring(duration: 0.35)) { action() }
+        } label: {
+            icon.scaledToFit()
+                .foregroundStyle(.secondary)
+                .frame(width: 13, height: 13)
+                .padding(5)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(key, modifiers: modifiers)
+        .help(label)
+    }
+}
+
+// Shows what is off-screen and jumps there. No timers: the viewport rect comes
+// from scroll geometry events, and panning happens only while dragging.
+struct Minimap: View {
+    let tiles: [SessionTile]
+    let layout: HoneycombLayout
+    let visible: CGRect
+    let contentSize: CGSize
+    let scrollTo: (CGPoint) -> Void
+
+    private let maxSide: CGFloat = 140
+
+    var body: some View {
+        // One uniform scale for both axes keeps the map a true miniature.
+        let scale = min(maxSide / max(contentSize.width, 1),
+                        maxSide / max(contentSize.height, 1))
+        let mapSize = CGSize(width: contentSize.width * scale,
+                             height: contentSize.height * scale)
+        let points = layout.positions(count: tiles.count).points
+
+        ZStack(alignment: .topLeading) {
+            ForEach(Array(tiles.enumerated()), id: \.element.id) { index, tile in
+                if index < points.count {
+                    Hexagon(cornerRadius: 1)
+                        .fill(statusColor(tile.status).opacity(0.9))
+                        .frame(width: layout.cellWidth * scale,
+                               height: layout.cellWidth * scale * 2 / sqrt(3))
+                        .position(x: points[index].x * scale,
+                                  y: points[index].y * scale)
+                }
+            }
+            Rectangle()
+                .strokeBorder(.primary.opacity(0.6), lineWidth: 1.5)
+                .frame(width: min(mapSize.width, visible.width * scale),
+                       height: min(mapSize.height, visible.height * scale))
+                .offset(x: visible.minX * scale, y: visible.minY * scale)
+        }
+        .frame(width: mapSize.width, height: mapSize.height)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0).onChanged { value in
+                scrollTo(CGPoint(
+                    x: value.location.x / scale - visible.width / 2,
+                    y: value.location.y / scale - visible.height / 2))
+            }
+        )
+        .padding(10)
+        .glassEffect(.regular, in: .rect(cornerRadius: 14))
     }
 }
 
@@ -1301,7 +1454,12 @@ struct ContentView: View {
     @State private var killTarget: SessionTile?
     @State private var confirmKill = false
     @State private var showStats = false
-    private let diameter: CGFloat = 176
+    @AppStorage("combZoom") private var zoom: Double = 1.0
+    @State private var viewport: CGSize = .zero
+    @State private var visible: CGRect = .zero
+    @State private var contentSize: CGSize = .zero
+    @State private var scroll = ScrollPosition()
+    @State private var pinchStart: Double?
 
     var body: some View {
         ZStack {
@@ -1314,22 +1472,7 @@ struct ContentView: View {
                     SessionTableView(tiles: model.tiles, focus: model.focus,
                                      requestKill: requestKill)
                 } else {
-                    ScrollView {
-                        // spacing is the liquid-merge distance; keep it well
-                        // under the comb gap or hovered hexes melt into blobs
-                        GlassEffectContainer(spacing: 4) {
-                            HoneycombLayout(cellWidth: diameter) {
-                                ForEach(model.tiles) { tile in
-                                    SessionOrb(tile: tile, diameter: diameter,
-                                               focus: model.focus,
-                                               requestKill: requestKill)
-                                        .glassEffectID(tile.id, in: glassSpace)
-                                }
-                            }
-                            .padding(.horizontal, 22)
-                            .padding(.vertical, 20)
-                        }
-                    }
+                    comb
                 }
                 if !model.usageLimits.isEmpty {
                     UsagePanel(limits: model.usageLimits) { showStats = true }
@@ -1352,6 +1495,83 @@ struct ContentView: View {
         .sheet(isPresented: $showStats) {
             StatsView(limits: model.usageLimits)
         }
+    }
+
+    private var comb: some View {
+        let layout = Comb.layout(count: model.tiles.count, zoom: zoom,
+                                 viewport: viewport)
+        let cell = Comb.baseCell * zoom
+        let overflows = contentSize.height > viewport.height + 1
+            || contentSize.width > viewport.width + 1
+
+        return ScrollView([.horizontal, .vertical]) {
+            // spacing is the liquid-merge distance; keep it well under the comb
+            // gap or hovered hexes melt into blobs
+            GlassEffectContainer(spacing: min(4, Comb.baseSpacing * zoom * 0.25)) {
+                layout {
+                    ForEach(model.tiles) { tile in
+                        SessionOrb(tile: tile, diameter: cell,
+                                   focus: model.focus, requestKill: requestKill)
+                            .glassEffectID(tile.id, in: glassSpace)
+                    }
+                }
+                .padding(Comb.padding)
+            }
+        }
+        .scrollPosition($scroll)
+        .onGeometryChange(for: CGSize.self, of: \.size) { viewport = $0 }
+        .onScrollGeometryChange(for: ScrollGeometry.self, of: { $0 }) { _, new in
+            visible = new.visibleRect
+            contentSize = new.contentSize
+        }
+        // A live pinch is bounded by the gesture, unlike a repeating animation,
+        // so it is safe to track it frame by frame under the glass.
+        .simultaneousGesture(
+            MagnifyGesture()
+                .onChanged { value in
+                    let target = (pinchStart ?? zoom) * Double(value.magnification)
+                    if pinchStart == nil { pinchStart = zoom }
+                    zoom = min(max(target, Comb.zoomRange.lowerBound),
+                               Comb.zoomRange.upperBound)
+                }
+                .onEnded { _ in pinchStart = nil }
+        )
+        .overlay(alignment: .bottomLeading) {
+            ZoomControls(zoom: $zoom, fit: fitToView).padding(14)
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if overflows {
+                Minimap(tiles: model.tiles, layout: layout, visible: visible,
+                        contentSize: contentSize) { point in
+                    scroll.scrollTo(point: point)
+                }
+                .padding(14)
+            }
+        }
+        .onKeyPress { press in
+            let step = CGSize(width: visible.width / 2, height: visible.height / 2)
+            switch press.key {
+            case .leftArrow: pan(dx: -step.width)
+            case .rightArrow: pan(dx: step.width)
+            case .upArrow: pan(dy: -step.height)
+            case .downArrow: pan(dy: step.height)
+            default: return .ignored
+            }
+            return .handled
+        }
+        .animation(.spring(duration: 0.35), value: zoom)
+    }
+
+    private func pan(dx: CGFloat = 0, dy: CGFloat = 0) {
+        scroll.scrollTo(point: CGPoint(
+            x: max(0, min(visible.minX + dx, contentSize.width - visible.width)),
+            y: max(0, min(visible.minY + dy, contentSize.height - visible.height))))
+    }
+
+    private func fitToView() {
+        guard viewport.width > 1 else { return }
+        zoom = Comb.fitZoom(count: model.tiles.count, viewport: viewport)
+        scroll.scrollTo(edge: .top)
     }
 
     private func requestKill(_ tile: SessionTile) {
@@ -1381,6 +1601,37 @@ struct ClaudeSessionsApp: App {
                 }
             }
             print("icons ok; \(Ph.names.count) phosphor svgs load")
+            // Fit must fit, and must be the largest zoom that does.
+            for count in [1, 3, 7, 12, 25, 40] {
+                for viewport in [CGSize(width: 900, height: 500),
+                                 CGSize(width: 600, height: 900),
+                                 CGSize(width: 1600, height: 1000)] {
+                    let zoom = Comb.fitZoom(count: count, viewport: viewport)
+                    let free = CGSize(width: viewport.width - Comb.padding * 2,
+                                      height: viewport.height - Comb.padding * 2)
+                    let size = Comb.contentSize(count: count, zoom: zoom,
+                                                viewportWidth: viewport.width)
+                    let fits = size.width <= free.width + 0.5
+                        && size.height <= free.height + 0.5
+                    // Or it bottomed out: some combs cannot fit at any usable
+                    // zoom, and then the minimap carries navigation.
+                    precondition(
+                        fits || zoom <= Comb.zoomRange.lowerBound + 0.001,
+                        "fitZoom(\(count), \(viewport)) overflows: \(size)")
+                    if zoom < Comb.fitCeiling - 0.001 {
+                        let bigger = Comb.contentSize(
+                            count: count, zoom: zoom * 1.05,
+                            viewportWidth: viewport.width)
+                        precondition(bigger.width > free.width
+                            || bigger.height > free.height,
+                            "fitZoom(\(count), \(viewport)) is not maximal")
+                    }
+                }
+            }
+            print("fit-to-view ok; 7 tiles in 900x500 ->",
+                  String(format: "%.0f%%",
+                         Comb.fitZoom(count: 7,
+                                      viewport: CGSize(width: 900, height: 500)) * 100))
             print("honeycomb layout ok; 7 ->",
                   layout.rowLengths(7, maxCols: 6).map(String.init).joined(separator: ","))
             let points = Stats.scan()
