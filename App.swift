@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 // MARK: - Data
 
@@ -172,6 +173,74 @@ enum Transcript {
     }
 }
 
+// MARK: - Account usage (live from Anthropic, not calculated)
+
+struct UsageLimit: Decodable, Equatable, Identifiable {
+    struct Scope: Decodable, Equatable {
+        struct ScopeModel: Decodable, Equatable { let displayName: String? }
+        let model: ScopeModel?
+    }
+    let kind: String
+    let percent: Double
+    let severity: String?
+    let resetsAt: Date?
+    let scope: Scope?
+
+    var id: String { kind + (scope?.model?.displayName ?? "") }
+
+    var label: String {
+        switch kind {
+        case "session": return "Session"
+        case "weekly_all": return "Week · all models"
+        case "weekly_scoped":
+            return "Week · \(scope?.model?.displayName ?? "model")"
+        default: return kind.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+}
+
+enum Usage {
+    struct Response: Decodable { let limits: [UsageLimit] }
+
+    // Claude Code's own OAuth token, from the login keychain.
+    // ponytail: goes through /usr/bin/security instead of SecItemCopyMatching —
+    // this ad-hoc binary changes every rebuild and would re-trigger the
+    // keychain permission prompt each time; the security CLI is already trusted.
+    static func token() -> String? {
+        let data = runCommand("/usr/bin/security",
+                              ["find-generic-password",
+                               "-s", "Claude Code-credentials", "-w"])
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = obj["claudeAiOauth"] as? [String: Any]
+        else { return nil }
+        return oauth["accessToken"] as? String
+    }
+
+    static func fetch() async -> [UsageLimit] {
+        guard let token = token(),
+              let url = URL(string: "https://api.anthropic.com/api/oauth/usage")
+        else { return [] }
+        var request = URLRequest(url: url)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200
+        else { return [] }
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        decoder.dateDecodingStrategy = .custom { d in
+            let s = try d.singleValueContainer().decode(String.self)
+            if let date = (try? Date(
+                s, strategy: Date.ISO8601FormatStyle(includingFractionalSeconds: true)))
+                ?? (try? Date(s, strategy: .iso8601)) { return date }
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: d.codingPath, debugDescription: "bad date \(s)"))
+        }
+        return (try? decoder.decode(Response.self, from: data))?.limits ?? []
+    }
+}
+
 // MARK: - Session loading
 
 enum Sessions {
@@ -225,7 +294,9 @@ enum Sessions {
 @MainActor
 final class Model: ObservableObject {
     @Published var tiles: [SessionTile] = []
+    @Published var usageLimits: [UsageLimit] = []
     private var timer: Timer?
+    private var usageTimer: Timer?
     // Session ids that finished work: went working -> idle and were not clicked yet.
     private var doneIds: Set<String> = []
 
@@ -233,6 +304,41 @@ final class Model: ObservableObject {
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             self?.refresh()
+        }
+        UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        refreshUsage()
+        usageTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) {
+            [weak self] _ in self?.refreshUsage()
+        }
+    }
+
+    nonisolated func refreshUsage() {
+        Task.detached(priority: .utility) {
+            let limits = await Usage.fetch()
+            guard !limits.isEmpty else { return }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if self.usageLimits != limits { self.usageLimits = limits }
+                self.alertGate(limits)
+            }
+        }
+    }
+
+    // Notify once per limit per reset window when usage crosses 80%.
+    private func alertGate(_ limits: [UsageLimit]) {
+        for limit in limits where limit.percent >= 80 {
+            let key = "usageAlert.\(limit.id)."
+                + (limit.resetsAt?.timeIntervalSince1970.description ?? "-")
+            guard !UserDefaults.standard.bool(forKey: key) else { continue }
+            UserDefaults.standard.set(true, forKey: key)
+            let content = UNMutableNotificationContent()
+            content.title = "Claude usage at \(Int(limit.percent))%"
+            content.body = limit.label + (limit.resetsAt.map {
+                ", resets \($0.formatted(.relative(presentation: .named)))" } ?? "")
+            content.sound = .default
+            UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: key, content: content, trigger: nil))
         }
     }
 
@@ -798,6 +904,59 @@ struct SessionTableView: View {
     }
 }
 
+struct UsageGauge: View {
+    let limit: UsageLimit
+
+    private var color: Color {
+        if limit.percent >= 95 { return .red }
+        if limit.percent >= 80 { return .orange }
+        return .green
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                Text(limit.label)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if limit.percent >= 80 {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9))
+                        .foregroundStyle(color)
+                }
+                Text("\(Int(limit.percent))%")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(color)
+            }
+            ProgressView(value: min(1, limit.percent / 100))
+                .tint(color)
+            Text(limit.resetsAt.map {
+                "resets \($0.formatted(.relative(presentation: .named)))" } ?? " ")
+                .font(.system(size: 10, design: .rounded))
+                .foregroundStyle(.tertiary)
+        }
+        .frame(minWidth: 130, maxWidth: 210)
+    }
+}
+
+struct UsagePanel: View {
+    let limits: [UsageLimit]
+
+    var body: some View {
+        HStack(spacing: 22) {
+            ForEach(limits) { UsageGauge(limit: $0) }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .glassEffect(.regular, in: .rect(cornerRadius: 18))
+        .padding(.horizontal, 22)
+        .padding(.bottom, 14)
+    }
+}
+
 struct EmptyStateView: View {
     var body: some View {
         VStack(spacing: 14) {
@@ -850,9 +1009,13 @@ struct ContentView: View {
                         }
                     }
                 }
+                if !model.usageLimits.isEmpty {
+                    UsagePanel(limits: model.usageLimits)
+                }
             }
         }
         .animation(.spring(duration: 0.5), value: model.tiles)
+        .animation(.spring(duration: 0.5), value: model.usageLimits)
         .frame(minWidth: 480, minHeight: 340)
         .confirmationDialog(
             "Kill \(killTarget?.name ?? "session")?",
@@ -889,6 +1052,17 @@ struct ClaudeSessionsApp: App {
             }
             print("honeycomb layout ok; 7 ->",
                   layout.rowLengths(7, maxCols: 6).map(String.init).joined(separator: ","))
+            let semaphore = DispatchSemaphore(value: 0)
+            // detached: init runs on the MainActor, and a plain Task would
+            // inherit it and deadlock against semaphore.wait() below
+            Task.detached {
+                for limit in await Usage.fetch() {
+                    print("usage\t\(limit.label)\t\(Int(limit.percent))%\t"
+                          + (limit.resetsAt?.formatted() ?? "-"))
+                }
+                semaphore.signal()
+            }
+            semaphore.wait()
             for tile in Sessions.load() {
                 print([tile.status, tile.name, tile.dir, tile.host ?? "-",
                        tile.model ?? "-", tile.contextTokens.map(String.init) ?? "-",
