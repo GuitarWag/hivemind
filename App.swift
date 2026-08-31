@@ -71,6 +71,7 @@ struct SessionTile: Identifiable, Equatable {
     let model: String?
     let contextTokens: Int?
     let host: String? // Ghostty, GoLand, WebStorm, ...
+    let hostAppPath: String?
 }
 
 // MARK: - Subprocesses
@@ -143,22 +144,37 @@ enum Hosts {
         return table
     }
 
+    struct HostApp: Equatable {
+        let name: String
+        let appPath: String? // nil for a bare CLI multiplexer
+    }
+
+    private static let ghosttyPath: String? = NSWorkspace.shared
+        .urlForApplication(withBundleIdentifier: "com.mitchellh.ghostty")?.path
+
     // Climb the parent chain until an .app bundle or a known host shows up.
     static func host(of pid: Int32,
-                     table: [Int32: (ppid: Int32, comm: String)]) -> String? {
+                     table: [Int32: (ppid: Int32, comm: String)]) -> HostApp? {
         var current = pid
         for _ in 0..<15 {
             guard let entry = table[current] else { return nil }
             let comm = entry.comm
+            // The outermost .app wins, so helper bundles report their host app.
             if let range = comm.range(of: ".app/") {
-                let bundle = comm[..<range.lowerBound]
-                return bundle.split(separator: "/").last.map(String.init)
+                let path = String(comm[..<range.lowerBound]) + ".app"
+                let name = (path as NSString).lastPathComponent
+                    .replacingOccurrences(of: ".app", with: "")
+                return HostApp(name: name, appPath: path)
             }
             let base = (comm as NSString).lastPathComponent
             // ponytail: herdr is a detached server, its ancestry ends at launchd.
             // This user's herdr renders in Ghostty (see dev-setup repo).
-            if base == "herdr" { return "Ghostty · herdr" }
-            if ["tmux", "zellij", "screen"].contains(base) { return base }
+            if base == "herdr" {
+                return HostApp(name: "Ghostty · herdr", appPath: ghosttyPath)
+            }
+            if ["tmux", "zellij", "screen"].contains(base) {
+                return HostApp(name: base, appPath: nil)
+            }
             current = entry.ppid
             if current <= 1 { return nil }
         }
@@ -299,6 +315,7 @@ enum Sessions {
                 ?? "unknown"
             let transcript = Transcript.info(
                 sessionId: session.sessionId, cwd: session.cwd)
+            let hostApp = Hosts.host(of: session.pid, table: processes)
             tiles.append(SessionTile(
                 id: session.sessionId,
                 name: session.name,
@@ -313,7 +330,8 @@ enum Sessions {
                     Date(timeIntervalSince1970: $0 / 1000) },
                 model: transcript.model,
                 contextTokens: transcript.tokens,
-                host: Hosts.host(of: session.pid, table: processes)
+                host: hostApp?.name,
+                hostAppPath: hostApp?.appPath
             ))
         }
         return tiles.sorted { $0.name < $1.name }
@@ -419,14 +437,15 @@ final class Model: ObservableObject {
             if let terminalId = tile.terminalId {
                 Herdr.run(["agent", "focus", terminalId])
             }
+            // Activate whichever app hosts this session (Ghostty, GoLand, ...).
+            // Tab-level focus only exists for herdr; IDE terminals cannot be
+            // addressed, so those land on the app itself.
+            guard let path = tile.hostAppPath else { return }
             await MainActor.run {
-                let workspace = NSWorkspace.shared
-                if let url = workspace.urlForApplication(
-                    withBundleIdentifier: "com.mitchellh.ghostty") {
-                    let config = NSWorkspace.OpenConfiguration()
-                    config.activates = true
-                    workspace.openApplication(at: url, configuration: config)
-                }
+                let config = NSWorkspace.OpenConfiguration()
+                config.activates = true
+                NSWorkspace.shared.openApplication(
+                    at: URL(fileURLWithPath: path), configuration: config)
             }
         }
     }
