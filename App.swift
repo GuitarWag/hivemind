@@ -1,6 +1,37 @@
 import SwiftUI
 import UserNotifications
 
+// MARK: - Phosphor icons (vendored SVGs, see icons/LICENSE)
+
+// macOS renders SVG through NSImage directly, so the icons need no asset
+// catalog and no package: template mode lets SwiftUI tint them like symbols.
+enum Ph {
+    static let lightningFill = load("lightning-fill")
+    static let moonFill = load("moon-fill")
+    static let warningFill = load("warning-fill")
+    static let checkCircleFill = load("check-circle-fill")
+    static let questionFill = load("question-fill")
+    static let hexagonBold = load("hexagon-bold")
+    static let listDashesBold = load("list-dashes-bold")
+    static let moonStarsDuotone = load("moon-stars-duotone")
+
+    static let names = [
+        "lightning-fill", "moon-fill", "warning-fill", "check-circle-fill",
+        "question-fill", "hexagon-bold", "list-dashes-bold", "moon-stars-duotone",
+    ]
+
+    static func url(_ name: String) -> URL? {
+        Bundle.main.url(forResource: name, withExtension: "svg", subdirectory: "icons")
+    }
+
+    private static func load(_ name: String) -> Image {
+        guard let url = url(name), let image = NSImage(contentsOf: url)
+        else { return Image(systemName: "questionmark") }
+        image.isTemplate = true
+        return Image(nsImage: image).renderingMode(.template).resizable()
+    }
+}
+
 // MARK: - Data
 
 struct ClaudeSessionFile: Decodable {
@@ -422,13 +453,13 @@ enum ViewMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-func statusSymbol(_ status: String) -> String {
+func statusIcon(_ status: String) -> Image {
     switch status {
-    case "idle": return "moon.zzz.fill"
-    case "working": return "bolt.fill"
-    case "blocked": return "exclamationmark.triangle.fill"
-    case "done": return "checkmark"
-    default: return "questionmark"
+    case "idle": return Ph.moonFill
+    case "working": return Ph.lightningFill
+    case "blocked": return Ph.warningFill
+    case "done": return Ph.checkCircleFill
+    default: return Ph.questionFill
     }
 }
 
@@ -645,10 +676,10 @@ struct SessionOrb: View {
         Button { focus(tile) } label: {
             ZStack {
                 VStack(spacing: diameter * 0.035) {
-                    Image(systemName: statusSymbol(tile.status))
-                        .font(.system(size: diameter * 0.16, weight: .semibold))
+                    statusIcon(tile.status)
+                        .scaledToFit()
                         .foregroundStyle(color.gradient)
-                        .symbolRenderingMode(.hierarchical)
+                        .frame(width: diameter * 0.19, height: diameter * 0.19)
                         .modifier(WorkingBlink(active: tile.status == "working"))
                     Text(tile.name)
                         .font(.system(size: diameter * 0.105, weight: .bold,
@@ -843,8 +874,10 @@ struct HeaderView: View {
                 }
             }
             Picker("View", selection: $mode) {
-                Image(systemName: "circle.hexagongrid.fill").tag(ViewMode.orbs)
-                Image(systemName: "list.bullet").tag(ViewMode.table)
+                Ph.hexagonBold.scaledToFit().frame(width: 14, height: 14)
+                    .tag(ViewMode.orbs)
+                Ph.listDashesBold.scaledToFit().frame(width: 14, height: 14)
+                    .tag(ViewMode.table)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -865,8 +898,10 @@ struct SessionTableView: View {
         Table(tiles, selection: $selection) {
             TableColumn("Status") { tile in
                 HStack(spacing: 6) {
-                    Circle().fill(statusColor(tile.status).gradient)
-                        .frame(width: 8, height: 8)
+                    statusIcon(tile.status)
+                        .scaledToFit()
+                        .foregroundStyle(statusColor(tile.status))
+                        .frame(width: 12, height: 12)
                     Text(tile.status.capitalized)
                         .foregroundStyle(statusColor(tile.status))
                         .fontWeight(.semibold)
@@ -922,9 +957,10 @@ struct UsageGauge: View {
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 if limit.percent >= 80 {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 9))
+                    Ph.warningFill
+                        .scaledToFit()
                         .foregroundStyle(color)
+                        .frame(width: 11, height: 11)
                 }
                 Text("\(Int(limit.percent))%")
                     .font(.system(size: 12, weight: .bold, design: .rounded))
@@ -960,10 +996,11 @@ struct UsagePanel: View {
 struct EmptyStateView: View {
     var body: some View {
         VStack(spacing: 14) {
-            Image(systemName: "moon.stars.fill")
-                .font(.system(size: 34, weight: .medium))
+            Ph.moonStarsDuotone
+                .scaledToFit()
                 .foregroundStyle(.secondary)
-                .frame(width: 110, height: 110)
+                .frame(width: 40, height: 40)
+                .padding(36)
                 .glassEffect(.regular, in: .circle)
             Text("No open Claude sessions")
                 .font(.system(size: 15, weight: .semibold, design: .rounded))
@@ -1050,6 +1087,12 @@ struct ClaudeSessionsApp: App {
                                  "rowLengths(\(n)) parity broken: \(rows)")
                 }
             }
+            for name in Ph.names {
+                guard let url = Ph.url(name), NSImage(contentsOf: url) != nil else {
+                    fatalError("icon \(name).svg missing from app bundle")
+                }
+            }
+            print("icons ok; \(Ph.names.count) phosphor svgs load")
             print("honeycomb layout ok; 7 ->",
                   layout.rowLengths(7, maxCols: 6).map(String.init).joined(separator: ","))
             let semaphore = DispatchSemaphore(value: 0)
