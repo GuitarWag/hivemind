@@ -52,9 +52,11 @@ struct ClaudeSessionFile: Decodable {
 
 struct HerdrAgent: Decodable {
     struct AgentSession: Decodable { let value: String }
-    let agentSession: AgentSession
+    let agent: String // claude | codex | ...
+    let agentSession: AgentSession? // codex reports no session id
     let agentStatus: String
     let terminalId: String
+    let cwd: String
     let focused: Bool
 }
 
@@ -64,18 +66,20 @@ struct HerdrAgentList: Decodable {
 }
 
 struct SessionTile: Identifiable, Equatable {
-    let id: String // Claude sessionId
+    let id: String // Claude sessionId, or herdr terminal id for Codex
+    let agent: String // claude | codex
     let name: String
     let dir: String
     var status: String // idle | working | blocked | done | unknown
     let terminalId: String?
     let focused: Bool
-    let pid: Int32
+    let pid: Int32? // Codex reports none, so it cannot be killed from here
     let cwd: String
     let version: String?
     let startedAt: Date?
     let model: String?
     let contextTokens: Int?
+    let contextWindow: Int? // Codex reports it; Claude does not
     let host: String? // Ghostty, GoLand, WebStorm, ...
     let hostAppPath: String?
 }
@@ -118,14 +122,19 @@ enum Herdr {
         runCommand(binary, args)
     }
 
-    static func agents() -> [String: HerdrAgent] {
+    static func agents() -> [HerdrAgent] {
         let data = run(["agent", "list"])
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        guard let list = try? decoder.decode(HerdrAgentList.self, from: data) else { return [:] }
+        return (try? decoder.decode(HerdrAgentList.self, from: data))?
+            .result.agents ?? []
+    }
+
+    // Claude sessions join by session id; Codex reports none.
+    static func bySessionId(_ agents: [HerdrAgent]) -> [String: HerdrAgent] {
         var map: [String: HerdrAgent] = [:]
-        for agent in list.result.agents {
-            map[agent.agentSession.value] = agent
+        for agent in agents {
+            if let id = agent.agentSession?.value { map[id] = agent }
         }
         return map
     }
@@ -238,8 +247,18 @@ struct UsageLimit: Decodable, Equatable, Identifiable {
     let severity: String?
     let resetsAt: Date?
     let scope: Scope?
+    // Codex only: it reports one window of arbitrary length instead of the
+    // fixed session/weekly pair Claude reports.
+    var windowMinutes: Int?
 
     var id: String { kind + (scope?.model?.displayName ?? "") }
+    var agent: String { kind.hasPrefix("codex") ? "codex" : "claude" }
+
+    private var windowName: String {
+        guard let minutes = windowMinutes, minutes > 0 else { return "window" }
+        if minutes % 1440 == 0 { return "\(minutes / 1440)d" }
+        return "\(minutes / 60)h"
+    }
 
     var label: String {
         switch kind {
@@ -247,6 +266,7 @@ struct UsageLimit: Decodable, Equatable, Identifiable {
         case "weekly_all": return "Week · all models"
         case "weekly_scoped":
             return "Week · \(scope?.model?.displayName ?? "model")"
+        case "codex_primary": return "Codex · \(windowName)"
         default: return kind.replacingOccurrences(of: "_", with: " ")
         }
     }
@@ -256,6 +276,7 @@ struct UsageLimit: Decodable, Equatable, Identifiable {
         case "session": return "5h"
         case "weekly_all": return "7d"
         case "weekly_scoped": return scope?.model?.displayName ?? "model"
+        case "codex_primary": return "codex"
         default: return kind.replacingOccurrences(of: "_", with: " ")
         }
     }
@@ -384,6 +405,143 @@ enum Stats {
     }
 }
 
+// MARK: - Codex rollouts
+
+// Codex has no live session registry like ~/.claude/sessions, so herdr supplies
+// which sessions exist and their status, and the rollout files supply model,
+// context and plan usage. Rollouts are matched by working directory because the
+// herdr codex integration reports no session id.
+enum Codex {
+    static let root = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/sessions")
+
+    struct Info {
+        var model: String?
+        var tokens: Int?
+        var contextWindow: Int?
+        var name: String?
+    }
+
+    // Newest rollout files first. Only a handful are ever relevant.
+    static func recentFiles(limit: Int = 40) -> [URL] {
+        let keys: [URLResourceKey] = [.contentModificationDateKey]
+        guard let walker = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: keys) else { return [] }
+        var found: [(URL, Date)] = []
+        for case let url as URL in walker where url.pathExtension == "jsonl" {
+            let modified = (try? url.resourceValues(forKeys: Set(keys)))?
+                .contentModificationDate ?? .distantPast
+            found.append((url, modified))
+        }
+        return found.sorted { $0.1 > $1.1 }.prefix(limit).map(\.0)
+    }
+
+    // The session_meta line embeds the full system prompt, so it runs to tens of
+    // kilobytes; read until the newline instead of guessing a chunk size.
+    static func firstLine(_ url: URL) -> [String: Any]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var buffer = Data()
+        while buffer.count < 1_048_576 {
+            guard let chunk = try? handle.read(upToCount: 64 * 1024),
+                  !chunk.isEmpty else { break }
+            buffer.append(chunk)
+            if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                buffer = buffer[buffer.startIndex..<newline]
+                break
+            }
+        }
+        guard let obj = try? JSONSerialization.jsonObject(with: buffer)
+                as? [String: Any] else { return nil }
+        return obj["payload"] as? [String: Any]
+    }
+
+    private static func tailObjects(_ url: URL, bytes: Int = 96 * 1024)
+        -> [[String: Any]] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        try? handle.seek(toOffset: size > UInt64(bytes)
+                         ? size - UInt64(bytes) : 0)
+        guard let data = try? handle.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap {
+            try? JSONSerialization.jsonObject(with: Data($0.utf8))
+                as? [String: Any]
+        }.compactMap { $0 }
+    }
+
+    // A session's own rollout, not one of the subagent rollouts it spawns.
+    private static func isMainSession(_ meta: [String: Any], cwd: String) -> Bool {
+        guard meta["cwd"] as? String == cwd else { return false }
+        if let source = meta["source"] as? [String: Any],
+           source["subagent"] != nil { return false }
+        return true
+    }
+
+    static func info(cwd: String, files: [URL]) -> Info {
+        var info = Info()
+        guard let url = files.first(where: {
+            guard let meta = firstLine($0) else { return false }
+            return isMainSession(meta, cwd: cwd)
+        }) else { return info }
+
+        info.name = firstLine(url)?["thread_name"] as? String
+        for object in tailObjects(url).reversed() {
+            guard let payload = object["payload"] as? [String: Any] else { continue }
+            let recordType = object["type"] as? String
+            let payloadType = payload["type"] as? String
+
+            if info.tokens == nil, payloadType == "token_count",
+               let detail = payload["info"] as? [String: Any] {
+                info.contextWindow = detail["model_context_window"] as? Int
+                // last_token_usage, not total: the total accumulates over the
+                // whole session and runs past the context window.
+                if let last = detail["last_token_usage"] as? [String: Any] {
+                    info.tokens = last["input_tokens"] as? Int
+                }
+            }
+            // The model lives on turn_context (an outer record type, so its
+            // payload carries no type) or on a thread_settings_applied event
+            // when the model was switched mid-session.
+            if info.model == nil {
+                if recordType == "turn_context" {
+                    info.model = payload["model"] as? String
+                } else if payloadType == "thread_settings_applied",
+                          let settings = payload["thread_settings"]
+                            as? [String: Any] {
+                    info.model = settings["model"] as? String
+                }
+            }
+            if info.tokens != nil, info.model != nil { break }
+        }
+        return info
+    }
+
+    // Plan usage is account-wide, so any recent rollout carries it.
+    static func planLimit(files: [URL]) -> UsageLimit? {
+        for url in files.prefix(8) {
+            for object in tailObjects(url).reversed() {
+                guard let payload = object["payload"] as? [String: Any],
+                      let limits = payload["rate_limits"] as? [String: Any],
+                      let primary = limits["primary"] as? [String: Any],
+                      let percent = primary["used_percent"] as? Double
+                else { continue }
+                let resets = (primary["resets_at"] as? Double)
+                    .map { Date(timeIntervalSince1970: $0) }
+                let minutes = primary["window_minutes"] as? Int ?? 0
+                return UsageLimit(
+                    kind: "codex_primary", percent: percent,
+                    severity: percent >= 80 ? "warning" : "normal",
+                    resetsAt: resets,
+                    scope: nil,
+                    windowMinutes: minutes)
+            }
+        }
+        return nil
+    }
+}
+
 // MARK: - Session loading
 
 enum Sessions {
@@ -394,7 +552,8 @@ enum Sessions {
         let fm = FileManager.default
         let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
         let decoder = JSONDecoder()
-        let herdr = Herdr.agents()
+        let agents = Herdr.agents()
+        let herdr = Herdr.bySessionId(agents)
         let processes = Hosts.processTable()
 
         var tiles: [SessionTile] = []
@@ -414,6 +573,7 @@ enum Sessions {
             let hostApp = Hosts.host(of: session.pid, table: processes)
             tiles.append(SessionTile(
                 id: session.sessionId,
+                agent: "claude",
                 name: session.name,
                 dir: (session.cwd as NSString).lastPathComponent,
                 status: status,
@@ -426,11 +586,45 @@ enum Sessions {
                     Date(timeIntervalSince1970: $0 / 1000) },
                 model: transcript.model,
                 contextTokens: transcript.tokens,
+                contextWindow: nil,
                 host: hostApp?.name,
                 hostAppPath: hostApp?.appPath
             ))
         }
+        tiles.append(contentsOf: codexTiles(agents: agents))
         return tiles.sorted { $0.name < $1.name }
+    }
+
+    // Codex sessions come from herdr, since Codex writes no live registry.
+    private static func codexTiles(agents: [HerdrAgent]) -> [SessionTile] {
+        let codex = agents.filter { $0.agent == "codex" }
+        guard !codex.isEmpty else { return [] }
+        let files = Codex.recentFiles()
+        let ghostty = NSWorkspace.shared
+            .urlForApplication(withBundleIdentifier: "com.mitchellh.ghostty")?.path
+
+        return codex.map { agent in
+            let info = Codex.info(cwd: agent.cwd, files: files)
+            let dir = (agent.cwd as NSString).lastPathComponent
+            return SessionTile(
+                id: agent.terminalId,
+                agent: "codex",
+                name: info.name?.isEmpty == false ? info.name! : dir,
+                dir: dir,
+                status: agent.agentStatus,
+                terminalId: agent.terminalId,
+                focused: agent.focused,
+                pid: nil,
+                cwd: agent.cwd,
+                version: nil,
+                startedAt: nil,
+                model: info.model,
+                contextTokens: info.tokens,
+                contextWindow: info.contextWindow,
+                host: "Ghostty · herdr",
+                hostAppPath: ghostty
+            )
+        }
     }
 }
 
@@ -440,6 +634,10 @@ enum Sessions {
 final class Model: ObservableObject {
     @Published var tiles: [SessionTile] = []
     @Published var usageLimits: [UsageLimit] = []
+
+    var agentCounts: [String: Int] {
+        Dictionary(grouping: tiles, by: \.agent).mapValues(\.count)
+    }
     private var timer: Timer?
     private var usageTimer: Timer?
     // Session ids that finished work: went working -> idle and were not clicked yet.
@@ -463,7 +661,13 @@ final class Model: ObservableObject {
 
     nonisolated func refreshUsage() {
         Task.detached(priority: .utility) {
-            let limits = await Usage.fetch()
+            var collected = await Usage.fetch()
+            // Codex plan usage rides along in its rollout files, so it needs no
+            // request and survives the Claude endpoint rate-limiting.
+            if let codex = Codex.planLimit(files: Codex.recentFiles(limit: 8)) {
+                collected.append(codex)
+            }
+            let limits = collected
             guard !limits.isEmpty else { return }
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -520,7 +724,8 @@ final class Model: ObservableObject {
     }
 
     nonisolated func terminate(_ tile: SessionTile) {
-        Darwin.kill(tile.pid, SIGTERM)
+        guard let pid = tile.pid else { return }
+        Darwin.kill(pid, SIGTERM)
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(700))
             self.refresh()
@@ -861,12 +1066,15 @@ struct SessionOrb: View {
                         .font(.system(size: diameter * 0.078, design: .rounded))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                    Text(tile.status.uppercased())
+                    Text(tile.agent == "claude"
+                         ? tile.status.uppercased()
+                         : "\(tile.agent.uppercased()) · \(tile.status.uppercased())")
                         .font(.system(size: diameter * 0.062, weight: .heavy,
                                       design: .rounded))
                         .kerning(1.2)
                         .foregroundStyle(color)
                         .opacity(0.9)
+                        .lineLimit(1)
                     if let host = tile.host {
                         Text(host.uppercased())
                             .font(.system(size: diameter * 0.05, weight: .semibold,
@@ -903,8 +1111,10 @@ struct SessionOrb: View {
         .buttonStyle(OrbButtonStyle())
         .contextMenu {
             Button("Focus") { focus(tile) }
-            Divider()
-            Button("Kill Session…", role: .destructive) { requestKill(tile) }
+            if tile.pid != nil {
+                Divider()
+                Button("Kill Session…", role: .destructive) { requestKill(tile) }
+            }
         }
         .onHover { over in
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
@@ -962,12 +1172,14 @@ struct InfoCard: View {
                 row("Version", tile.version ?? "—")
                 row("Started", tile.startedAt.map {
                     $0.formatted(.relative(presentation: .named)) } ?? "—")
-                row("PID", "\(tile.pid)")
+                row("Agent", tile.agent.capitalized)
+                row("PID", tile.pid.map(String.init) ?? "—")
             }
             if let tokens = tile.contextTokens {
-                // ponytail: max context is a guess (>190k means a 1M session);
-                // the session file does not record the real limit.
-                let cap = tokens > 190_000 ? 1_000_000 : 200_000
+                // Codex reports its window exactly. Claude does not, so there
+                // the cap is inferred: over 190k means a 1M session.
+                let cap = tile.contextWindow
+                    ?? (tokens > 190_000 ? 1_000_000 : 200_000)
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Context")
@@ -1156,15 +1368,62 @@ struct ViewModeToggle: View {
     }
 }
 
+struct AgentTabs: View {
+    @Binding var selection: String // all | claude | codex
+    let counts: [String: Int]
+
+    var body: some View {
+        HStack(spacing: 3) {
+            tab("all", "All", counts.values.reduce(0, +))
+            ForEach(["claude", "codex"], id: \.self) { agent in
+                if let count = counts[agent], count > 0 {
+                    tab(agent, agent.capitalized, count)
+                }
+            }
+        }
+        .padding(3)
+        .glassEffect(.regular, in: .capsule)
+    }
+
+    private func tab(_ id: String, _ label: String, _ count: Int) -> some View {
+        let selected = selection == id
+        return Button {
+            withAnimation(.spring(duration: 0.3)) { selection = id }
+        } label: {
+            HStack(spacing: 4) {
+                Text(label)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                Text("\(count)")
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                    .opacity(0.6)
+            }
+            .foregroundStyle(selected ? AnyShapeStyle(.primary)
+                                      : AnyShapeStyle(.secondary))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .glassEffect(
+                .regular.tint(Color.accentColor.opacity(selected ? 0.3 : 0)),
+                in: .capsule)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 struct HeaderView: View {
     let tiles: [SessionTile]
     @Binding var mode: ViewMode
+    @Binding var agentFilter: String
+    let agentCounts: [String: Int]
     private static let order = ["working", "done", "blocked", "idle", "unknown"]
 
     var body: some View {
         HStack(spacing: 10) {
             Text("Hivemind")
                 .font(.system(size: 20, weight: .bold, design: .rounded))
+            if agentCounts.count > 1 {
+                AgentTabs(selection: $agentFilter, counts: agentCounts)
+            }
             Spacer()
             GlassEffectContainer(spacing: 8) {
                 HStack(spacing: 8) {
@@ -1203,6 +1462,8 @@ struct SessionTableView: View {
                 }
             }
             .width(min: 70, ideal: 84)
+            TableColumn("Agent") { Text($0.agent.capitalized) }
+                .width(min: 55, ideal: 62)
             TableColumn("Name") { Text($0.name).fontWeight(.semibold) }
             TableColumn("Folder") { Text($0.dir).foregroundStyle(.secondary) }
             TableColumn("Running in") { Text($0.host ?? "—") }
@@ -1402,7 +1663,7 @@ struct StatsView: View {
                             }
                         }
                     }
-                    card("Tokens per day by model, last 14 days") {
+                    card("Claude tokens per day by model, last 14 days") {
                         if let points, !points.isEmpty {
                             chart(points)
                         } else if points == nil {
@@ -1540,17 +1801,25 @@ struct ContentView: View {
     @State private var contentSize: CGSize = .zero
     @State private var scroll = ScrollPosition()
     @State private var pinchStart: Double?
+    @AppStorage("agentFilter") private var agentFilter: String = "all"
+
+    private var tiles: [SessionTile] {
+        agentFilter == "all"
+            ? model.tiles
+            : model.tiles.filter { $0.agent == agentFilter }
+    }
 
     var body: some View {
         ZStack {
             MeshBackground()
             VStack(spacing: 0) {
-                HeaderView(tiles: model.tiles, mode: $mode)
+                HeaderView(tiles: tiles, mode: $mode, agentFilter: $agentFilter,
+                           agentCounts: model.agentCounts)
                 Group {
-                    if model.tiles.isEmpty {
+                    if tiles.isEmpty {
                         EmptyStateView()
                     } else if mode == .table {
-                        SessionTableView(tiles: model.tiles, focus: model.focus,
+                        SessionTableView(tiles: tiles, focus: model.focus,
                                          requestKill: requestKill)
                     } else {
                         comb
@@ -1571,8 +1840,10 @@ struct ContentView: View {
             "Kill \(killTarget?.name ?? "session")?",
             isPresented: $confirmKill, presenting: killTarget
         ) { tile in
-            Button("Kill \(tile.name) (pid \(tile.pid))", role: .destructive) {
-                model.terminate(tile)
+            if let pid = tile.pid {
+                Button("Kill \(tile.name) (pid \(pid))", role: .destructive) {
+                    model.terminate(tile)
+                }
             }
         } message: { tile in
             Text("Sends SIGTERM to the claude process in \(tile.dir).")
@@ -1583,7 +1854,7 @@ struct ContentView: View {
     }
 
     private var comb: some View {
-        let layout = Comb.layout(count: model.tiles.count, zoom: zoom,
+        let layout = Comb.layout(count: tiles.count, zoom: zoom,
                                  viewport: viewport)
         let cell = Comb.baseCell * zoom
         let overflows = contentSize.height > viewport.height + 1
@@ -1594,7 +1865,7 @@ struct ContentView: View {
             // gap or hovered hexes melt into blobs
             GlassEffectContainer(spacing: min(4, Comb.baseSpacing * zoom * 0.25)) {
                 layout {
-                    ForEach(model.tiles) { tile in
+                    ForEach(tiles) { tile in
                         SessionOrb(tile: tile, diameter: cell,
                                    focus: model.focus, requestKill: requestKill)
                             .glassEffectID(tile.id, in: glassSpace)
@@ -1624,7 +1895,7 @@ struct ContentView: View {
         .overlay(alignment: .bottomTrailing) {
             VStack(alignment: .trailing, spacing: 10) {
                 if overflows {
-                    Minimap(tiles: model.tiles, layout: layout, visible: visible,
+                    Minimap(tiles: tiles, layout: layout, visible: visible,
                             contentSize: contentSize) { point in
                         scroll.scrollTo(point: point)
                     }
@@ -1655,7 +1926,7 @@ struct ContentView: View {
 
     private func fitToView() {
         guard viewport.width > 1 else { return }
-        zoom = Comb.fitZoom(count: model.tiles.count, viewport: viewport)
+        zoom = Comb.fitZoom(count: tiles.count, viewport: viewport)
         scroll.scrollTo(edge: .top)
     }
 
@@ -1726,20 +1997,41 @@ struct HivemindApp: App {
                 print("stats\t\(day.formatted(date: .numeric, time: .omitted))"
                       + "\t\(formatTokens(tokens))")
             }
+            // Exercise the Codex rollout parser on a real main-session file.
+            let codexFiles = Codex.recentFiles()
+            for url in codexFiles {
+                guard let meta = Codex.firstLine(url),
+                      let cwd = meta["cwd"] as? String,
+                      (meta["source"] as? [String: Any])?["subagent"] == nil
+                else { continue }
+                let info = Codex.info(cwd: cwd, files: codexFiles)
+                print("codex-parse\t\((cwd as NSString).lastPathComponent)"
+                      + "\t\(info.model ?? "-")"
+                      + "\t\(info.tokens.map(formatTokens) ?? "-")"
+                      + "\t\(info.contextWindow.map(formatTokens) ?? "-")")
+                break
+            }
             let semaphore = DispatchSemaphore(value: 0)
             // detached: init runs on the MainActor, and a plain Task would
             // inherit it and deadlock against semaphore.wait() below
             Task.detached {
-                for limit in await Usage.fetch() {
-                    print("usage\t\(limit.label)\t\(Int(limit.percent))%\t"
+                var limits = await Usage.fetch()
+                if let codex = Codex.planLimit(files: Codex.recentFiles(limit: 8)) {
+                    limits.append(codex)
+                }
+                for limit in limits {
+                    print("usage\t\(limit.agent)\t\(limit.label)"
+                          + "\t\(Int(limit.percent))%\t"
                           + (limit.resetsAt?.formatted() ?? "-"))
                 }
                 semaphore.signal()
             }
             semaphore.wait()
             for tile in Sessions.load() {
-                print([tile.status, tile.name, tile.dir, tile.host ?? "-",
-                       tile.model ?? "-", tile.contextTokens.map(String.init) ?? "-",
+                print([tile.agent, tile.status, tile.name, tile.dir,
+                       tile.host ?? "-", tile.model ?? "-",
+                       tile.contextTokens.map(String.init) ?? "-",
+                       tile.contextWindow.map(String.init) ?? "-",
                        tile.terminalId ?? "-"].joined(separator: "\t"))
             }
             exit(0)
