@@ -266,7 +266,7 @@ struct UsageLimit: Decodable, Equatable, Identifiable {
         case "weekly_all": return "Week · all models"
         case "weekly_scoped":
             return "Week · \(scope?.model?.displayName ?? "model")"
-        case "codex_primary": return "Codex · \(windowName)"
+        case "codex_primary", "codex_secondary": return "Codex · \(windowName)"
         default: return kind.replacingOccurrences(of: "_", with: " ")
         }
     }
@@ -276,7 +276,7 @@ struct UsageLimit: Decodable, Equatable, Identifiable {
         case "session": return "5h"
         case "weekly_all": return "7d"
         case "weekly_scoped": return scope?.model?.displayName ?? "model"
-        case "codex_primary": return "codex"
+        case "codex_primary", "codex_secondary": return "cdx \(windowName)"
         default: return kind.replacingOccurrences(of: "_", with: " ")
         }
     }
@@ -518,27 +518,35 @@ enum Codex {
         return info
     }
 
-    // Plan usage is account-wide, so any recent rollout carries it.
-    static func planLimit(files: [URL]) -> UsageLimit? {
+    // Plan usage is account-wide, so any recent rollout carries it. Codex
+    // reports a primary and an optional secondary window, and which is which
+    // depends on the plan: a ChatGPT plan shares a five-hour allowance and can
+    // carry an extra weekly limit, while this account's "go" plan reports a
+    // single 30-day window. So take both and label each from its own window
+    // length rather than assuming either shape. With an API key instead of a
+    // ChatGPT plan there are no plan percentages at all, and no gauge appears.
+    static func planLimits(files: [URL]) -> [UsageLimit] {
         for url in files.prefix(8) {
             for object in tailObjects(url).reversed() {
                 guard let payload = object["payload"] as? [String: Any],
-                      let limits = payload["rate_limits"] as? [String: Any],
-                      let primary = limits["primary"] as? [String: Any],
-                      let percent = primary["used_percent"] as? Double
+                      let limits = payload["rate_limits"] as? [String: Any]
                 else { continue }
-                let resets = (primary["resets_at"] as? Double)
-                    .map { Date(timeIntervalSince1970: $0) }
-                let minutes = primary["window_minutes"] as? Int ?? 0
-                return UsageLimit(
-                    kind: "codex_primary", percent: percent,
-                    severity: percent >= 80 ? "warning" : "normal",
-                    resetsAt: resets,
-                    scope: nil,
-                    windowMinutes: minutes)
+                let found = ["primary", "secondary"].compactMap { key -> UsageLimit? in
+                    guard let window = limits[key] as? [String: Any],
+                          let percent = window["used_percent"] as? Double
+                    else { return nil }
+                    return UsageLimit(
+                        kind: "codex_\(key)", percent: percent,
+                        severity: percent >= 80 ? "warning" : "normal",
+                        resetsAt: (window["resets_at"] as? Double)
+                            .map { Date(timeIntervalSince1970: $0) },
+                        scope: nil,
+                        windowMinutes: window["window_minutes"] as? Int)
+                }
+                if !found.isEmpty { return found }
             }
         }
-        return nil
+        return []
     }
 }
 
@@ -664,9 +672,8 @@ final class Model: ObservableObject {
             var collected = await Usage.fetch()
             // Codex plan usage rides along in its rollout files, so it needs no
             // request and survives the Claude endpoint rate-limiting.
-            if let codex = Codex.planLimit(files: Codex.recentFiles(limit: 8)) {
-                collected.append(codex)
-            }
+            collected.append(contentsOf:
+                Codex.planLimits(files: Codex.recentFiles(limit: 8)))
             let limits = collected
             guard !limits.isEmpty else { return }
             await MainActor.run { [weak self] in
@@ -1658,7 +1665,11 @@ struct StatsView: View {
                     header
                     if !limits.isEmpty {
                         card("Plan limits, live from your account") {
-                            HStack(alignment: .top, spacing: 24) {
+                            // Wraps instead of an HStack: the row outgrew the
+                            // sheet and clipped once Codex added a gauge.
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 160),
+                                                         spacing: 20)],
+                                      alignment: .leading, spacing: 14) {
                                 ForEach(limits) { UsageGauge(limit: $0) }
                             }
                         }
@@ -1707,7 +1718,7 @@ struct StatsView: View {
                 .padding(22)
             }
         }
-        .frame(minWidth: 620, minHeight: 560)
+        .frame(minWidth: 660, idealWidth: 780, minHeight: 580, idealHeight: 700)
         .task {
             let scanned = await Task.detached(priority: .userInitiated) {
                 Stats.scan()
@@ -2016,9 +2027,8 @@ struct HivemindApp: App {
             // inherit it and deadlock against semaphore.wait() below
             Task.detached {
                 var limits = await Usage.fetch()
-                if let codex = Codex.planLimit(files: Codex.recentFiles(limit: 8)) {
-                    limits.append(codex)
-                }
+                limits.append(contentsOf:
+                    Codex.planLimits(files: Codex.recentFiles(limit: 8)))
                 for limit in limits {
                     print("usage\t\(limit.agent)\t\(limit.label)"
                           + "\t\(Int(limit.percent))%\t"
