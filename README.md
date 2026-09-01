@@ -37,6 +37,17 @@ That prints one line per session, the usage limits, and runs the built-in self-c
 loading, comb layout parity, fit-to-view maths, the fuzzy matcher, the Codex rollout parser).
 Use it whenever you change anything in the data layer.
 
+## Widget mode
+
+`⌘⇧M`, or the collapse button in the header, shrinks the window to a floating panel pinned to a
+corner of the screen. It stays above other windows, lists one compact row per session with its
+status colour, keeps the plan usage bars at the bottom, and a click still focuses the session's
+terminal tab. `⌘⇧M` again, or the expand button, restores the full window.
+
+The corner is chosen from the small menu in the panel and remembered, as is widget mode itself, so
+the app reopens the way you left it. The panel is draggable anywhere by its background if you want
+it somewhere other than a corner, and rows scroll past nine sessions.
+
 ## Where the data comes from
 
 Nothing is scraped from a terminal and nothing is guessed from a screenshot.

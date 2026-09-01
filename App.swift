@@ -19,6 +19,7 @@ enum Ph {
     static let minusBold = load("minus-bold")
     static let plusBold = load("plus-bold")
     static let cornersOutBold = load("corners-out-bold")
+    static let cornersInBold = load("corners-in-bold")
     static let magnifyingGlassBold = load("magnifying-glass-bold")
     static let xBold = load("x-bold")
 
@@ -26,7 +27,7 @@ enum Ph {
         "lightning-fill", "moon-fill", "warning-fill", "check-circle-fill",
         "question-fill", "hexagon-bold", "list-dashes-bold", "moon-stars-duotone",
         "chart-bar-bold", "minus-bold", "plus-bold", "corners-out-bold",
-        "magnifying-glass-bold", "x-bold",
+        "magnifying-glass-bold", "x-bold", "corners-in-bold",
     ]
 
     static func url(_ name: String) -> URL? {
@@ -1666,6 +1667,216 @@ struct AgentTabs: View {
     }
 }
 
+// MARK: - Widget mode
+
+enum Corner: String, CaseIterable, Identifiable {
+    case topLeading, topTrailing, bottomLeading, bottomTrailing
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .topLeading: return "Top left"
+        case .topTrailing: return "Top right"
+        case .bottomLeading: return "Bottom left"
+        case .bottomTrailing: return "Bottom right"
+        }
+    }
+
+    // Origin for a window of this size, in screen coordinates where y grows up.
+    func origin(for size: CGSize, in screen: CGRect,
+                margin: CGFloat = 16) -> CGPoint {
+        let x = self == .topLeading || self == .bottomLeading
+            ? screen.minX + margin
+            : screen.maxX - margin - size.width
+        let y = self == .topLeading || self == .topTrailing
+            ? screen.maxY - margin - size.height
+            : screen.minY + margin
+        return CGPoint(x: x, y: y)
+    }
+}
+
+// Drives the real NSWindow: SwiftUI cannot float a window above other apps,
+// pin it to a corner, or drop its minimum size on its own.
+struct WindowStyler: NSViewRepresentable {
+    let widget: Bool
+    let corner: Corner
+    // Content size, measured from the rendered widget rather than guessed.
+    let size: CGSize
+
+    func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        // The window is not attached on the first layout pass.
+        DispatchQueue.main.async {
+            guard let window = view.window else { return }
+            apply(to: window)
+        }
+    }
+
+    private func apply(to window: NSWindow) {
+        if widget {
+            window.level = .floating
+            window.isMovableByWindowBackground = true
+            window.minSize = CGSize(width: 180, height: 100)
+            window.maxSize = CGSize(width: 420, height: 900)
+            let screen = (window.screen ?? NSScreen.main)?.visibleFrame
+                ?? .zero
+            // Content size to window size, so the title bar is accounted for
+            // instead of padding the height by a guess.
+            let frameSize = window.frameRect(
+                forContentRect: CGRect(origin: .zero, size: size)).size
+            let target = CGRect(origin: corner.origin(for: frameSize,
+                                                      in: screen),
+                                size: frameSize)
+            // Re-applied on every state change, so skip the no-op to stop the
+            // window creeping and re-animating.
+            if abs(window.frame.height - target.height) > 1
+                || abs(window.frame.width - target.width) > 1
+                || abs(window.frame.origin.x - target.origin.x) > 1
+                || abs(window.frame.origin.y - target.origin.y) > 1 {
+                window.setFrame(target, display: true, animate: false)
+            }
+        } else {
+            window.level = .normal
+            window.isMovableByWindowBackground = false
+            window.minSize = CGSize(width: 820, height: 360)
+            window.maxSize = CGSize(width: CGFloat.greatestFiniteMagnitude,
+                                    height: CGFloat.greatestFiniteMagnitude)
+            // Grow back to a usable size and pull the window fully on screen:
+            // the widget corner would otherwise leave a full-width window
+            // hanging off the edge it was pinned to.
+            var frame = window.frame
+            frame.size.width = max(frame.width, 980)
+            frame.size.height = max(frame.height, 620)
+            let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? frame
+            frame.origin.x = min(max(frame.minX, screen.minX),
+                                 max(screen.minX, screen.maxX - frame.width))
+            frame.origin.y = min(max(frame.minY, screen.minY),
+                                 max(screen.minY, screen.maxY - frame.height))
+            if frame != window.frame {
+                window.setFrame(frame, display: true, animate: false)
+            }
+        }
+    }
+}
+
+struct WidgetRow: View {
+    let tile: SessionTile
+    let focus: (SessionTile) -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        let color = statusColor(tile.status)
+        Button { focus(tile) } label: {
+            HStack(spacing: 7) {
+                Hexagon(cornerRadius: 1.5)
+                    .fill(color.gradient)
+                    .frame(width: 9, height: 10.4)
+                Text(tile.name)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if tile.status == "working" {
+                    Ph.lightningFill.scaledToFit()
+                        .foregroundStyle(color)
+                        .frame(width: 8, height: 8)
+                }
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(hovered ? AnyShapeStyle(color.opacity(0.16))
+                                : AnyShapeStyle(.clear),
+                        in: RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .help("\(tile.name) — \(tile.dir) (\(tile.status))")
+    }
+}
+
+struct WidgetView: View {
+    let tiles: [SessionTile]
+    let limits: [UsageLimit]
+    @Binding var corner: Corner
+    let focus: (SessionTile) -> Void
+    let expand: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Text("Hivemind")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Menu {
+                    Picker("Corner", selection: $corner) {
+                        ForEach(Corner.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                } label: {
+                    Ph.hexagonBold.scaledToFit().frame(width: 9, height: 9)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .frame(width: 14)
+                .help("Pin to a corner")
+                Button(action: expand) {
+                    Ph.cornersOutBold.scaledToFit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10, height: 10)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .help("Back to the full window")
+            }
+            if tiles.isEmpty {
+                Text("No open sessions")
+                    .font(.system(size: 10, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                    .padding(.vertical, 6)
+            } else {
+                // Scrollable on purpose: windowResizability(.contentMinSize)
+                // enforces the content's minimum as the window's minimum, and a
+                // plain VStack of rows cannot compress, so the window could not
+                // be made small. A ScrollView has a negligible minimum.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(tiles) { tile in
+                            WidgetRow(tile: tile, focus: focus)
+                        }
+                    }
+                }
+                .scrollIndicators(.never)
+                .frame(maxHeight: .infinity)
+            }
+            if !limits.isEmpty {
+                Divider().padding(.vertical, 1)
+                ForEach(limits) { limit in
+                    HStack(spacing: 5) {
+                        Text(limit.shortLabel)
+                            .font(.system(size: 9, weight: .semibold,
+                                          design: .rounded))
+                            .foregroundStyle(.tertiary)
+                            .frame(width: 40, alignment: .leading)
+                            .lineLimit(1)
+                        UsageBar(percent: limit.percent,
+                                 color: usageColor(limit.percent), height: 3)
+                        Text("\(limit.wholePercent)%")
+                            .font(.system(size: 9, weight: .bold,
+                                          design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(usageColor(limit.percent))
+                            .frame(width: 26, alignment: .trailing)
+                    }
+                }
+            }
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(.black.opacity(0.001)) // keep the whole panel draggable
+    }
+}
+
 struct SearchField: View {
     @Binding var query: String
     @FocusState private var focused: Bool
@@ -1710,6 +1921,7 @@ struct HeaderView: View {
     @Binding var agentFilter: String
     @Binding var query: String
     let agentCounts: [String: Int]
+    let enterWidget: () -> Void
     private static let order = ["working", "done", "blocked", "idle", "unknown"]
 
     var body: some View {
@@ -1731,6 +1943,16 @@ struct HeaderView: View {
                 }
             }
             ViewModeToggle(mode: $mode)
+            Button(action: enterWidget) {
+                Ph.cornersInBold.scaledToFit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 13, height: 13)
+                    .padding(6)
+                    .glassEffect(.regular, in: .circle)
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+            .help("Widget mode")
         }
         // Overlaid rather than placed in the row, so the field sits at the true
         // centre of the header instead of wherever the side groups leave it.
@@ -2109,6 +2331,17 @@ struct ContentView: View {
     @AppStorage("agentFilter") private var agentFilter: String = "all"
 
     @State private var query = ""
+    @AppStorage("widgetMode") private var widget = false
+    @AppStorage("widgetCorner") private var corner: Corner = .topTrailing
+
+    // Deterministic: the rows scroll, so this decides the panel height rather
+    // than the content pushing it around. Shows up to 9 rows before scrolling.
+    private var widgetSize: CGSize {
+        let rows = CGFloat(min(max(model.tiles.count, 1), 9))
+        let limits = CGFloat(model.usageLimits.count)
+        return CGSize(width: 232,
+                      height: 34 + rows * 23 + (limits > 0 ? limits * 15 + 12 : 0))
+    }
 
     private var tiles: [SessionTile] {
         let byAgent = agentFilter == "all"
@@ -2125,11 +2358,30 @@ struct ContentView: View {
     }
 
     var body: some View {
+        Group {
+            if widget {
+                ZStack {
+                    MeshBackground()
+                    WidgetView(
+                        tiles: model.tiles, limits: model.usageLimits,
+                        corner: $corner, focus: model.focus,
+                        expand: { widget = false })
+                }
+            } else {
+                fullView
+            }
+        }
+        .background(WindowStyler(widget: widget, corner: corner,
+                                 size: widgetSize))
+    }
+
+    private var fullView: some View {
         ZStack {
             MeshBackground()
             VStack(spacing: 0) {
                 HeaderView(tiles: tiles, mode: $mode, agentFilter: $agentFilter,
-                           query: $query, agentCounts: model.agentCounts)
+                           query: $query, agentCounts: model.agentCounts,
+                           enterWidget: { widget = true })
                 Group {
                     if tiles.isEmpty {
                         EmptyStateView(query: query)
