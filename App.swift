@@ -1698,14 +1698,17 @@ enum Corner: String, CaseIterable, Identifiable {
 
 // Drives the real NSWindow: SwiftUI cannot float a window above other apps,
 // pin it to a corner, or drop its minimum size on its own.
+// Holds the NSWindow so the views can resize it from an event handler. No
+// @Published: storing the reference must not trigger a re-render.
+@MainActor
+final class WindowBox: ObservableObject {
+    weak var window: NSWindow?
+}
+
 struct WindowStyler: NSViewRepresentable {
     let widget: Bool
     let corner: Corner
-    let width: CGFloat
-    // Explicit, because contentView.fittingSize reports the window's current
-    // height rather than the content's ideal, so deriving it from there makes
-    // whatever height the window already had permanent.
-    let height: CGFloat
+    let box: WindowBox
 
     // Keeps the panel pinned when SwiftUI resizes the window to fit its
     // content, which happens whenever a session starts or stops.
@@ -1762,10 +1765,15 @@ struct WindowStyler: NSViewRepresentable {
     func updateNSView(_ view: NSView, context: Context) {
         context.coordinator.widget = widget
         context.coordinator.corner = corner
-        // The window is not attached on the first layout pass, and geometry must
-        // not be touched from inside one.
-        DispatchQueue.main.async {
+        // Deliberately delayed rather than a plain main-queue async. A block
+        // dispatched to the main queue can still run inside AppKit's
+        // CATransaction commit, and resizing a window from inside that display
+        // cycle throws from _postWindowNeedsUpdateConstraints and kills the
+        // app. A short delay puts the geometry change after the layout pass
+        // that the state change triggered.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             guard let window = view.window else { return }
+            box.window = window
             context.coordinator.watch(window)
             // Level, style mask and button visibility only change with the
             // mode, not on every session refresh.
@@ -1792,7 +1800,9 @@ struct WindowStyler: NSViewRepresentable {
             // otherwise the opaque window background sits behind it.
             window.isOpaque = false
             window.backgroundColor = .clear
-            window.hasShadow = true
+            // No shadow: the window is a rectangle and the collapsed badge is a
+            // circle inside it, so the shadow drew a box around empty space.
+            window.hasShadow = false
             window.titlebarAppearsTransparent = true
             window.styleMask.insert(.fullSizeContentView)
             // At this width the traffic lights crowd the panel's own header.
@@ -1810,27 +1820,19 @@ struct WindowStyler: NSViewRepresentable {
         }
     }
 
+    // The size is deliberately NOT set here. Every attempt to resize the window
+    // in response to a SwiftUI state change threw from
+    // _postWindowNeedsUpdateConstraints and killed the app, whether the call was
+    // dispatched, delayed or animated, because the resize lands inside AppKit's
+    // display cycle. The content declares its exact size instead and AppKit
+    // resizes the window itself, which is safe. This only keeps a stale saved
+    // frame from overriding that; the origin is pinned by the resize observer.
     private func applyWidgetFrame(to window: NSWindow) {
-        // Deliberately a range, not a fixed width. Pinning min == max makes the
-        // window unsatisfiable for a moment while the SwiftUI content is still
-        // the other size (badge 54 vs panel 226), which AppKit reports as a
-        // constraint exception during its display cycle and that kills the app.
+        // A range, not a fixed width: min == max makes the window
+        // unsatisfiable while the content is still the other size.
         window.minSize = CGSize(width: 50, height: 56)
         window.maxSize = CGSize(width: 460, height: 900)
-        // macOS restores the window's saved frame, so without an explicit size
-        // the panel keeps whatever it was last time, including a full-window
-        // height. The frame still includes window chrome even with a hidden
-        // title bar, so add it rather than leaving the panel short.
-        let chrome = max(0, window.frame.height - window.contentLayoutRect.height)
-        let size = CGSize(width: width, height: height + chrome)
-        guard abs(window.frame.width - size.width) > 1
-            || abs(window.frame.height - size.height) > 1 else { return }
-        let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
-        // Animated: this fires when the panel collapses to a badge or opens
-        // back up, and it is a one-shot, not a running loop.
-        window.setFrame(
-            CGRect(origin: corner.origin(for: size, in: screen), size: size),
-            display: true, animate: true)
+        window.isRestorable = false
     }
 
     private func applyFullFrame(to window: NSWindow) {
@@ -1979,23 +1981,27 @@ struct WidgetView: View {
     let width: CGFloat
     let height: CGFloat
 
-    @Binding var collapsed: Bool
+    let badgeAlignment: Alignment
+    let collapsed: Bool
+    let setCollapsed: (Bool) -> Void
     let interact: () -> Void
     @State private var hoveredName: String?
 
     var body: some View {
         Group {
             if collapsed {
+                // Drawn in the window's pinned corner. The rest of the window
+                // stays fully transparent, which paints nothing and lets clicks
+                // through to whatever is behind it.
                 CombBadge(tiles: tiles)
                     .onHover { over in
                         if over {
                             interact()
-                            withAnimation(.spring(response: 0.42,
-                                                  dampingFraction: 0.78)) {
-                                collapsed = false
-                            }
+                            setCollapsed(false)
                         }
                     }
+                    .frame(width: width, height: height,
+                           alignment: badgeAlignment)
             } else {
                 panel
             }
@@ -2050,12 +2056,10 @@ struct WidgetView: View {
         .padding(.horizontal, 9)
         .padding(.top, 6)
         .padding(.bottom, 9)
-        // minHeight is what actually sets the window size, since
-        // windowResizability(.contentMinSize) enforces the content's minimum.
-        // maxHeight .infinity then lets the glass fill the window's chrome as
-        // well, instead of leaving a transparent band above the panel.
-        .frame(minWidth: width, maxWidth: width,
-               minHeight: height, maxHeight: .infinity, alignment: .top)
+        // An exact size, because this is what drives the window size: AppKit
+        // resizes to fit the declared content, and doing it that way round is
+        // the only version that does not crash. See applyWidgetFrame.
+        .frame(width: width, height: height, alignment: .top)
         // The panel is the window: one glass surface, nothing opaque behind it.
         // .clear rather than .regular, so the desktop reads through it.
         .glassEffect(.clear, in: .rect(cornerRadius: 16))
@@ -2086,9 +2090,7 @@ struct WidgetView: View {
                 corner = all[next]
             }
             iconButton(Ph.minusBold, "Collapse to a badge") {
-                withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
-                    collapsed = true
-                }
+                setCollapsed(true)
             }
             iconButton(Ph.cornersOutBold, "Full window", action: expand)
                 .keyboardShortcut("m", modifiers: [.command, .shift])
@@ -2573,14 +2575,61 @@ struct ContentView: View {
     private let idleTick = Timer.publish(every: 5, on: .main, in: .common)
         .autoconnect()
 
-    private var widgetWidth: CGFloat { widgetCollapsed ? badgeSide : 226 }
+    @StateObject private var windowBox = WindowBox()
+    private let panelWidth: CGFloat = 226
 
-    private var widgetHeight: CGFloat {
-        guard !widgetCollapsed else { return badgeSide }
-        let comb = MiniComb.size(count: model.tiles.count, width: 226 - 18)
+    private var panelHeight: CGFloat {
+        let comb = MiniComb.size(count: model.tiles.count, width: panelWidth - 18)
         let limits = CGFloat(model.usageLimits.count)
         return 22 + 6 + max(comb.height, 24) + 20
             + (limits > 0 ? limits * 15 + 10 : 0) + 15
+    }
+
+    private var badgeAlignment: Alignment {
+        switch corner {
+        case .topLeading: return .topLeading
+        case .topTrailing: return .topTrailing
+        case .bottomLeading: return .bottomLeading
+        case .bottomTrailing: return .bottomTrailing
+        }
+    }
+
+    // Collapsing does NOT resize the window. Resizing a SwiftUI-hosted window
+    // in response to a state change throws from
+    // _postWindowNeedsUpdateConstraints and kills the app, and every variation
+    // of dispatching, delaying or animating it failed the same way. The window
+    // keeps the panel's size and the badge is simply drawn in the corner of it:
+    // a non-opaque window ignores mouse events where its pixels are fully
+    // transparent, so the empty area neither blocks clicks nor shows anything.
+    private func setCollapsed(_ value: Bool) {
+        withAnimation(.spring(response: 0.42, dampingFraction: 0.8)) {
+            widgetCollapsed = value
+        }
+    }
+
+    // Sized once per mode switch, from the button's event handler.
+    private func resizeForMode(widget: Bool) {
+        guard let window = windowBox.window else { return }
+        let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+        if widget {
+            let chrome = max(0, window.frame.height
+                             - window.contentLayoutRect.height)
+            let size = CGSize(width: panelWidth, height: panelHeight + chrome)
+            window.setFrame(
+                CGRect(origin: corner.origin(for: size, in: screen), size: size),
+                display: true)
+        } else {
+            let size = CGSize(width: max(window.frame.width, 980),
+                              height: max(window.frame.height, 620))
+            window.setFrame(
+                CGRect(origin: CGPoint(
+                    x: min(max(window.frame.minX, screen.minX),
+                           max(screen.minX, screen.maxX - size.width)),
+                    y: min(max(window.frame.minY, screen.minY),
+                           max(screen.minY, screen.maxY - size.height))),
+                    size: size),
+                display: true)
+        }
     }
 
     private var tiles: [SessionTile] {
@@ -2608,28 +2657,43 @@ struct ContentView: View {
                     expand: {
                         widgetCollapsed = false
                         widget = false
+                        resizeForMode(widget: false)
                     },
-                    width: widgetWidth, height: widgetHeight,
-                    collapsed: $widgetCollapsed,
+                    width: panelWidth, height: panelHeight,
+                    badgeAlignment: badgeAlignment,
+                    collapsed: widgetCollapsed,
+                    setCollapsed: setCollapsed,
                     interact: { lastInteraction = Date() })
                     .ignoresSafeArea()
             } else {
                 fullView
             }
         }
-        .background(WindowStyler(widget: widget, corner: corner,
-                                 width: widgetWidth, height: widgetHeight))
+        .background(WindowStyler(widget: widget, corner: corner, box: windowBox))
+        .onAppear {
+            // Launching straight into widget mode leaves whatever frame the
+            // window had. Delayed so it lands well clear of the launch layout
+            // pass, where the same call is fatal.
+            guard widget else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                resizeForMode(widget: true)
+            }
+        }
         // A coarse timer rather than a pending sleep: the 2 second session
         // refresh re-creates the widget view, which restarted a .task(id:)
-        // before it ever reached a minute. Only fires state when it flips, so
+        // before it ever reached a minute. Only writes state when it flips, so
         // it costs nothing under the glass.
         .onReceive(idleTick) { _ in
-            guard widget, !widgetCollapsed,
+            guard widget else { return }
+            // Debug: exercises both directions of the collapse transition.
+            if ProcessInfo.processInfo.arguments.contains("--widget-cycle") {
+                setCollapsed(!widgetCollapsed)
+                return
+            }
+            guard !widgetCollapsed,
                   Date().timeIntervalSince(lastInteraction) >= 60
             else { return }
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
-                widgetCollapsed = true
-            }
+            setCollapsed(true)
         }
     }
 
@@ -2643,6 +2707,7 @@ struct ContentView: View {
                                widgetCollapsed = false
                                lastInteraction = Date()
                                widget = true
+                               resizeForMode(widget: true)
                            })
                 Group {
                     if tiles.isEmpty {
