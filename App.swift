@@ -1700,45 +1700,102 @@ enum Corner: String, CaseIterable, Identifiable {
 struct WindowStyler: NSViewRepresentable {
     let widget: Bool
     let corner: Corner
-    // Content size, measured from the rendered widget rather than guessed.
-    let size: CGSize
+    let width: CGFloat
+    // Explicit, because contentView.fittingSize reports the window's current
+    // height rather than the content's ideal, so deriving it from there makes
+    // whatever height the window already had permanent.
+    let height: CGFloat
+
+    // Keeps the panel pinned when SwiftUI resizes the window to fit its
+    // content, which happens whenever a session starts or stops.
+    @MainActor
+    final class Coordinator {
+        var observer: NSObjectProtocol?
+        var widget = false
+        var corner: Corner = .topTrailing
+
+        func watch(_ window: NSWindow) {
+            guard observer == nil else { return }
+            observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.didResizeNotification,
+                object: window, queue: .main
+            ) { _ in
+                // queue: .main, so this is already on the main actor.
+                MainActor.assumeIsolated {
+                    guard self.widget else { return }
+                    self.pin(window)
+                }
+            }
+        }
+
+        func pin(_ window: NSWindow) {
+            let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+            window.setFrameOrigin(
+                corner.origin(for: window.frame.size, in: screen))
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSView { NSView(frame: .zero) }
 
     func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.widget = widget
+        context.coordinator.corner = corner
         // The window is not attached on the first layout pass.
         DispatchQueue.main.async {
             guard let window = view.window else { return }
+            context.coordinator.watch(window)
             apply(to: window)
+            if widget { context.coordinator.pin(window) }
         }
     }
 
     private func apply(to window: NSWindow) {
+        let trafficLights: [NSWindow.ButtonType] =
+            [.closeButton, .miniaturizeButton, .zoomButton]
+
         if widget {
             window.level = .floating
             window.isMovableByWindowBackground = true
-            window.minSize = CGSize(width: 180, height: 100)
-            window.maxSize = CGSize(width: 420, height: 900)
-            let screen = (window.screen ?? NSScreen.main)?.visibleFrame
-                ?? .zero
-            // Content size to window size, so the title bar is accounted for
-            // instead of padding the height by a guess.
-            let frameSize = window.frameRect(
-                forContentRect: CGRect(origin: .zero, size: size)).size
-            let target = CGRect(origin: corner.origin(for: frameSize,
-                                                      in: screen),
-                                size: frameSize)
-            // Re-applied on every state change, so skip the no-op to stop the
-            // window creeping and re-animating.
-            if abs(window.frame.height - target.height) > 1
-                || abs(window.frame.width - target.width) > 1
-                || abs(window.frame.origin.x - target.origin.x) > 1
-                || abs(window.frame.origin.y - target.origin.y) > 1 {
-                window.setFrame(target, display: true, animate: false)
+            // A clear window is what lets the glass actually be translucent:
+            // otherwise the opaque window background sits behind it.
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.hasShadow = true
+            window.titlebarAppearsTransparent = true
+            window.styleMask.insert(.fullSizeContentView)
+            // At 232pt wide the traffic lights crowd the panel's own header.
+            for button in trafficLights {
+                window.standardWindowButton(button)?.isHidden = true
+            }
+            window.minSize = CGSize(width: width, height: 80)
+            window.maxSize = CGSize(width: width, height: 900)
+            // macOS restores the window's saved frame, so without an explicit
+            // size the panel keeps whatever it was last time, including a
+            // full-window height. Fit the height to the content instead: the
+            // rows are capped and scroll, so this is bounded.
+            let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+            // The frame still includes window chrome even with a hidden title
+            // bar, so add it rather than leaving the panel short of the frame.
+            let chrome = max(0, window.frame.height
+                             - window.contentLayoutRect.height)
+            let size = CGSize(width: width, height: height + chrome)
+            if abs(window.frame.width - size.width) > 1
+                || abs(window.frame.height - size.height) > 1 {
+                window.setFrame(
+                    CGRect(origin: corner.origin(for: size, in: screen),
+                           size: size),
+                    display: true, animate: false)
             }
         } else {
             window.level = .normal
             window.isMovableByWindowBackground = false
+            window.isOpaque = true
+            window.backgroundColor = .windowBackgroundColor
+            for button in trafficLights {
+                window.standardWindowButton(button)?.isHidden = false
+            }
             window.minSize = CGSize(width: 820, height: 360)
             window.maxSize = CGSize(width: CGFloat.greatestFiniteMagnitude,
                                     height: CGFloat.greatestFiniteMagnitude)
@@ -1800,26 +1857,32 @@ struct WidgetView: View {
     @Binding var corner: Corner
     let focus: (SessionTile) -> Void
     let expand: () -> Void
+    let width: CGFloat
+    let height: CGFloat
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Text("Hivemind")
-                    .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                    .kerning(0.4)
                 Spacer()
-                Menu {
-                    Picker("Corner", selection: $corner) {
-                        ForEach(Corner.allCases) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.inline)
+                // Cycles corners on click. A Menu here inflated the row: macOS
+                // menu controls carry a minimum control height regardless of
+                // what the label contains. Right-click the panel for the list.
+                Button {
+                    let all = Corner.allCases
+                    let next = (all.firstIndex(of: corner).map { $0 + 1 } ?? 0)
+                        % all.count
+                    corner = all[next]
                 } label: {
-                    Ph.hexagonBold.scaledToFit().frame(width: 9, height: 9)
+                    Ph.hexagonBold.scaledToFit()
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 9, height: 9)
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .frame(width: 14)
-                .help("Pin to a corner")
+                .buttonStyle(.plain)
+                .help("Move to the next corner — \(corner.label)")
                 Button(action: expand) {
                     Ph.cornersOutBold.scaledToFit()
                         .foregroundStyle(.secondary)
@@ -1829,6 +1892,7 @@ struct WidgetView: View {
                 .keyboardShortcut("m", modifiers: [.command, .shift])
                 .help("Back to the full window")
             }
+            .frame(height: 12)
             if tiles.isEmpty {
                 Text("No open sessions")
                     .font(.system(size: 10, design: .rounded))
@@ -1847,7 +1911,9 @@ struct WidgetView: View {
                     }
                 }
                 .scrollIndicators(.never)
-                .frame(maxHeight: .infinity)
+                // Caps the panel: beyond this the rows scroll rather than the
+                // window growing down the screen.
+                .frame(maxHeight: 190)
             }
             if !limits.isEmpty {
                 Divider().padding(.vertical, 1)
@@ -1871,9 +1937,27 @@ struct WidgetView: View {
                 }
             }
         }
-        .padding(9)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(.black.opacity(0.001)) // keep the whole panel draggable
+        .padding(.horizontal, 9)
+        .padding(.top, 7)
+        .padding(.bottom, 9)
+        // minHeight is what actually sets the window size, since
+        // windowResizability(.contentMinSize) enforces the content's minimum.
+        // maxHeight .infinity then lets the glass fill the window's chrome as
+        // well, instead of leaving a transparent band above the panel.
+        .frame(minWidth: width, maxWidth: width,
+               minHeight: height, maxHeight: .infinity, alignment: .top)
+        // The panel is the window: one glass surface, nothing opaque behind it.
+        // .clear rather than .regular, so the desktop reads through it.
+        .glassEffect(.clear, in: .rect(cornerRadius: 16))
+        .contentShape(Rectangle()) // whole panel draggable by its background
+        .contextMenu {
+            Picker("Corner", selection: $corner) {
+                ForEach(Corner.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.inline)
+            Divider()
+            Button("Full window", action: expand)
+        }
     }
 }
 
@@ -2334,13 +2418,13 @@ struct ContentView: View {
     @AppStorage("widgetMode") private var widget = false
     @AppStorage("widgetCorner") private var corner: Corner = .topTrailing
 
-    // Deterministic: the rows scroll, so this decides the panel height rather
-    // than the content pushing it around. Shows up to 9 rows before scrolling.
-    private var widgetSize: CGSize {
-        let rows = CGFloat(min(max(model.tiles.count, 1), 9))
+    private let widgetWidth: CGFloat = 226
+
+    // Rows are capped and scroll past eight, so this stays bounded.
+    private var widgetHeight: CGFloat {
+        let rows = CGFloat(min(max(model.tiles.count, 1), 8))
         let limits = CGFloat(model.usageLimits.count)
-        return CGSize(width: 232,
-                      height: 34 + rows * 23 + (limits > 0 ? limits * 15 + 12 : 0))
+        return 24 + rows * 23 + (limits > 0 ? limits * 15 + 10 : 0) + 12
     }
 
     private var tiles: [SessionTile] {
@@ -2360,19 +2444,20 @@ struct ContentView: View {
     var body: some View {
         Group {
             if widget {
-                ZStack {
-                    MeshBackground()
-                    WidgetView(
-                        tiles: model.tiles, limits: model.usageLimits,
-                        corner: $corner, focus: model.focus,
-                        expand: { widget = false })
-                }
+                // No mesh background here: the point of widget mode is to see
+                // the desktop through it, so the glass is the only surface.
+                WidgetView(
+                    tiles: model.tiles, limits: model.usageLimits,
+                    corner: $corner, focus: model.focus,
+                    expand: { widget = false },
+                    width: widgetWidth, height: widgetHeight)
+                    .ignoresSafeArea()
             } else {
                 fullView
             }
         }
         .background(WindowStyler(widget: widget, corner: corner,
-                                 size: widgetSize))
+                                 width: widgetWidth, height: widgetHeight))
     }
 
     private var fullView: some View {

@@ -5,10 +5,30 @@
 # GIT_AUTHOR_DATE to an evening time is a valid way to commit at any hour.
 # scripts/evening-commit.sh does that for you.
 
-stamp="${GIT_AUTHOR_DATE:-$(date +%Y-%m-%dT%H:%M:%S)}"
+stamp="${GIT_AUTHOR_DATE:-$(date +%Y-%m-%dT%H:%M:%S%z)}"
+hour=""
 
-# Pull HH out of "...THH:MM..." or "... HH:MM ...". Fall back to the clock.
-hour=$(printf '%s' "$stamp" | sed -n 's/.*[T ]\([0-9][0-9]\):[0-9][0-9].*/\1/p')
+case "$stamp" in
+    @*)
+        # Git normalises dates it parsed into its own raw format,
+        # "@<epoch> <offset>", which is what a hook actually receives.
+        epoch=${stamp#@}
+        epoch=${epoch%% *}
+        offset=${stamp##* }
+        sign=$(printf '%s' "$offset" | cut -c1)
+        offset_hours=$(printf '%s' "$offset" | cut -c2-3)
+        offset_minutes=$(printf '%s' "$offset" | cut -c4-5)
+        shift_seconds=$((10#$offset_hours * 3600 + 10#$offset_minutes * 60))
+        [ "$sign" = "-" ] && shift_seconds=$((-shift_seconds))
+        hour=$(printf '%02d' $((((epoch + shift_seconds) / 3600) % 24)))
+        ;;
+    *)
+        # "...THH:MM..." or "... HH:MM ..."
+        hour=$(printf '%s' "$stamp" |
+            sed -n 's/.*[T ]\([0-9][0-9]\):[0-9][0-9].*/\1/p')
+        ;;
+esac
+
 [ -z "$hour" ] && hour=$(date +%H)
 
 if [ "$((10#$hour))" -lt 19 ]; then

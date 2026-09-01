@@ -44,9 +44,10 @@ corner of the screen. It stays above other windows, lists one compact row per se
 status colour, keeps the plan usage bars at the bottom, and a click still focuses the session's
 terminal tab. `⌘⇧M` again, or the expand button, restores the full window.
 
-The corner is chosen from the small menu in the panel and remembered, as is widget mode itself, so
-the app reopens the way you left it. The panel is draggable anywhere by its background if you want
-it somewhere other than a corner, and rows scroll past nine sessions.
+The hexagon button cycles through the four corners, and right-clicking the panel picks one
+directly. Both the corner and widget mode itself are remembered, so the app reopens the way you left
+it. The panel is draggable anywhere by its background if you want it somewhere other than a corner,
+and rows scroll past eight sessions.
 
 ## Where the data comes from
 
