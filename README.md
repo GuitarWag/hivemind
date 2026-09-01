@@ -40,14 +40,20 @@ Use it whenever you change anything in the data layer.
 ## Widget mode
 
 `⌘⇧M`, or the collapse button in the header, shrinks the window to a floating panel pinned to a
-corner of the screen. It stays above other windows, lists one compact row per session with its
-status colour, keeps the plan usage bars at the bottom, and a click still focuses the session's
-terminal tab. `⌘⇧M` again, or the expand button, restores the full window.
+corner of the screen. It stays above other windows and shows the same honeycomb, just small: one
+hexagon per session in its status colour, using the same `Hexagon` shape and `HoneycombLayout` as
+the full window. Hovering a hexagon names that session below the comb, since a name does not fit
+inside a 34pt tile, and clicking one still focuses its terminal tab. The plan usage bars stay at the
+bottom.
+
+After a minute without hover or click, the panel shrinks further to a small translucent cluster of
+hexagons tinted by the most urgent session status. Hovering it springs the panel back open, and from
+there `⌘⇧M` or the expand button returns to the full window. The minus button collapses it to the
+badge by hand.
 
 The hexagon button cycles through the four corners, and right-clicking the panel picks one
 directly. Both the corner and widget mode itself are remembered, so the app reopens the way you left
-it. The panel is draggable anywhere by its background if you want it somewhere other than a corner,
-and rows scroll past eight sessions.
+it. The panel is draggable anywhere by its background if you want it somewhere other than a corner.
 
 ## Where the data comes from
 

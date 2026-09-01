@@ -1,4 +1,5 @@
 import Charts
+import Combine
 import SwiftUI
 import UserNotifications
 
@@ -1713,6 +1714,10 @@ struct WindowStyler: NSViewRepresentable {
         var observer: NSObjectProtocol?
         var widget = false
         var corner: Corner = .topTrailing
+        // What has already been applied, so styling is not re-applied on every
+        // session refresh.
+        var appliedMode: Bool?
+        private var pinning = false
 
         func watch(_ window: NSWindow) {
             guard observer == nil else { return }
@@ -1721,7 +1726,20 @@ struct WindowStyler: NSViewRepresentable {
                 object: window, queue: .main
             ) { _ in
                 // queue: .main, so this is already on the main actor.
+                MainActor.assumeIsolated { self.schedulePin(window) }
+            }
+        }
+
+        // Deferred to the next turn of the run loop. Moving the window from
+        // inside the resize notification mutates geometry during AppKit's
+        // display cycle, which throws an uncaught exception and takes the app
+        // down; the guard stops pin -> resize -> pin from looping.
+        func schedulePin(_ window: NSWindow) {
+            guard widget, !pinning else { return }
+            pinning = true
+            DispatchQueue.main.async {
                 MainActor.assumeIsolated {
+                    defer { self.pinning = false }
                     guard self.widget else { return }
                     self.pin(window)
                 }
@@ -1730,8 +1748,10 @@ struct WindowStyler: NSViewRepresentable {
 
         func pin(_ window: NSWindow) {
             let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
-            window.setFrameOrigin(
-                corner.origin(for: window.frame.size, in: screen))
+            let target = corner.origin(for: window.frame.size, in: screen)
+            guard abs(window.frame.origin.x - target.x) > 1
+                || abs(window.frame.origin.y - target.y) > 1 else { return }
+            window.setFrameOrigin(target)
         }
     }
 
@@ -1742,16 +1762,26 @@ struct WindowStyler: NSViewRepresentable {
     func updateNSView(_ view: NSView, context: Context) {
         context.coordinator.widget = widget
         context.coordinator.corner = corner
-        // The window is not attached on the first layout pass.
+        // The window is not attached on the first layout pass, and geometry must
+        // not be touched from inside one.
         DispatchQueue.main.async {
             guard let window = view.window else { return }
             context.coordinator.watch(window)
-            apply(to: window)
-            if widget { context.coordinator.pin(window) }
+            // Level, style mask and button visibility only change with the
+            // mode, not on every session refresh.
+            if context.coordinator.appliedMode != widget {
+                context.coordinator.appliedMode = widget
+                applyMode(to: window)
+            }
+            if widget {
+                applyWidgetFrame(to: window)
+            } else {
+                applyFullFrame(to: window)
+            }
         }
     }
 
-    private func apply(to window: NSWindow) {
+    private func applyMode(to window: NSWindow) {
         let trafficLights: [NSWindow.ButtonType] =
             [.closeButton, .miniaturizeButton, .zoomButton]
 
@@ -1765,28 +1795,9 @@ struct WindowStyler: NSViewRepresentable {
             window.hasShadow = true
             window.titlebarAppearsTransparent = true
             window.styleMask.insert(.fullSizeContentView)
-            // At 232pt wide the traffic lights crowd the panel's own header.
+            // At this width the traffic lights crowd the panel's own header.
             for button in trafficLights {
                 window.standardWindowButton(button)?.isHidden = true
-            }
-            window.minSize = CGSize(width: width, height: 80)
-            window.maxSize = CGSize(width: width, height: 900)
-            // macOS restores the window's saved frame, so without an explicit
-            // size the panel keeps whatever it was last time, including a
-            // full-window height. Fit the height to the content instead: the
-            // rows are capped and scroll, so this is bounded.
-            let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
-            // The frame still includes window chrome even with a hidden title
-            // bar, so add it rather than leaving the panel short of the frame.
-            let chrome = max(0, window.frame.height
-                             - window.contentLayoutRect.height)
-            let size = CGSize(width: width, height: height + chrome)
-            if abs(window.frame.width - size.width) > 1
-                || abs(window.frame.height - size.height) > 1 {
-                window.setFrame(
-                    CGRect(origin: corner.origin(for: size, in: screen),
-                           size: size),
-                    display: true, animate: false)
             }
         } else {
             window.level = .normal
@@ -1796,58 +1807,166 @@ struct WindowStyler: NSViewRepresentable {
             for button in trafficLights {
                 window.standardWindowButton(button)?.isHidden = false
             }
-            window.minSize = CGSize(width: 820, height: 360)
-            window.maxSize = CGSize(width: CGFloat.greatestFiniteMagnitude,
-                                    height: CGFloat.greatestFiniteMagnitude)
-            // Grow back to a usable size and pull the window fully on screen:
-            // the widget corner would otherwise leave a full-width window
-            // hanging off the edge it was pinned to.
-            var frame = window.frame
-            frame.size.width = max(frame.width, 980)
-            frame.size.height = max(frame.height, 620)
-            let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? frame
-            frame.origin.x = min(max(frame.minX, screen.minX),
-                                 max(screen.minX, screen.maxX - frame.width))
-            frame.origin.y = min(max(frame.minY, screen.minY),
-                                 max(screen.minY, screen.maxY - frame.height))
-            if frame != window.frame {
-                window.setFrame(frame, display: true, animate: false)
-            }
         }
+    }
+
+    private func applyWidgetFrame(to window: NSWindow) {
+        // Deliberately a range, not a fixed width. Pinning min == max makes the
+        // window unsatisfiable for a moment while the SwiftUI content is still
+        // the other size (badge 54 vs panel 226), which AppKit reports as a
+        // constraint exception during its display cycle and that kills the app.
+        window.minSize = CGSize(width: 50, height: 56)
+        window.maxSize = CGSize(width: 460, height: 900)
+        // macOS restores the window's saved frame, so without an explicit size
+        // the panel keeps whatever it was last time, including a full-window
+        // height. The frame still includes window chrome even with a hidden
+        // title bar, so add it rather than leaving the panel short.
+        let chrome = max(0, window.frame.height - window.contentLayoutRect.height)
+        let size = CGSize(width: width, height: height + chrome)
+        guard abs(window.frame.width - size.width) > 1
+            || abs(window.frame.height - size.height) > 1 else { return }
+        let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? .zero
+        // Animated: this fires when the panel collapses to a badge or opens
+        // back up, and it is a one-shot, not a running loop.
+        window.setFrame(
+            CGRect(origin: corner.origin(for: size, in: screen), size: size),
+            display: true, animate: true)
+    }
+
+    private func applyFullFrame(to window: NSWindow) {
+        window.minSize = CGSize(width: 820, height: 360)
+        window.maxSize = CGSize(width: CGFloat.greatestFiniteMagnitude,
+                                height: CGFloat.greatestFiniteMagnitude)
+        // Grow back to a usable size and pull the window fully on screen: the
+        // widget corner would otherwise leave a full-width window hanging off
+        // the edge it had been pinned to.
+        var frame = window.frame
+        frame.size.width = max(frame.width, 980)
+        frame.size.height = max(frame.height, 620)
+        let screen = (window.screen ?? NSScreen.main)?.visibleFrame ?? frame
+        frame.origin.x = min(max(frame.minX, screen.minX),
+                             max(screen.minX, screen.maxX - frame.width))
+        frame.origin.y = min(max(frame.minY, screen.minY),
+                             max(screen.minY, screen.maxY - frame.height))
+        guard frame != window.frame else { return }
+        window.setFrame(frame, display: true, animate: false)
     }
 }
 
-struct WidgetRow: View {
-    let tile: SessionTile
+// The comb, shrunk. Same Hexagon shape, same status colours and the same
+// HoneycombLayout as the full window, so the widget is recognisably the app
+// rather than a generic list.
+struct MiniComb: View {
+    let tiles: [SessionTile]
+    let width: CGFloat
     let focus: (SessionTile) -> Void
+    @Binding var hoveredName: String?
+
+    static let cell: CGFloat = 34
+    static let gap: CGFloat = 5
+
+    static func layout(count: Int, width: CGFloat) -> HoneycombLayout {
+        HoneycombLayout(cellWidth: cell, spacing: gap,
+                        maxCols: max(1, Int((width + gap) / (cell + gap))),
+                        containerWidth: width)
+    }
+
+    static func size(count: Int, width: CGFloat) -> CGSize {
+        layout(count: count, width: width).positions(count: count).size
+    }
+
+    var body: some View {
+        let layout = Self.layout(count: tiles.count, width: width)
+        let points = layout.positions(count: tiles.count).points
+        let size = layout.positions(count: tiles.count).size
+
+        ZStack(alignment: .topLeading) {
+            ForEach(Array(tiles.enumerated()), id: \.element.id) { index, tile in
+                if index < points.count {
+                    MiniHex(tile: tile, side: Self.cell, focus: focus,
+                            hoveredName: $hoveredName)
+                        .position(x: points[index].x, y: points[index].y)
+                }
+            }
+        }
+        .frame(width: size.width, height: size.height)
+    }
+}
+
+struct MiniHex: View {
+    let tile: SessionTile
+    let side: CGFloat
+    let focus: (SessionTile) -> Void
+    @Binding var hoveredName: String?
     @State private var hovered = false
 
     var body: some View {
         let color = statusColor(tile.status)
         Button { focus(tile) } label: {
-            HStack(spacing: 7) {
-                Hexagon(cornerRadius: 1.5)
-                    .fill(color.gradient)
-                    .frame(width: 9, height: 10.4)
-                Text(tile.name)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                if tile.status == "working" {
-                    Ph.lightningFill.scaledToFit()
-                        .foregroundStyle(color)
-                        .frame(width: 8, height: 8)
-                }
-            }
-            .padding(.horizontal, 7)
-            .padding(.vertical, 4)
-            .background(hovered ? AnyShapeStyle(color.opacity(0.16))
-                                : AnyShapeStyle(.clear),
-                        in: RoundedRectangle(cornerRadius: 7))
+            statusIcon(tile.status)
+                .scaledToFit()
+                .foregroundStyle(color.gradient)
+                .frame(width: side * 0.34, height: side * 0.34)
+                .frame(width: side, height: side * 2 / sqrt(3))
+                .background(color.opacity(hovered ? 0.5 : 0.28),
+                            in: Hexagon(cornerRadius: side * 0.1))
+                .overlay(
+                    Hexagon(cornerRadius: side * 0.1)
+                        .stroke(color.opacity(tile.focused ? 0.95 : 0.4),
+                                lineWidth: tile.focused ? 1.8 : 0.8)
+                )
+                .scaleEffect(hovered ? 1.1 : 1)
+                .contentShape(Hexagon(cornerRadius: side * 0.1))
         }
         .buttonStyle(.plain)
-        .onHover { hovered = $0 }
+        .onHover { over in
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
+                hovered = over
+            }
+            hoveredName = over ? "\(tile.name) · \(tile.status)" : nil
+        }
         .help("\(tile.name) — \(tile.dir) (\(tile.status))")
+    }
+}
+
+// The idle state: a small cluster of hexagons, tinted by the most urgent
+// session status, that opens the panel on hover.
+struct CombBadge: View {
+    let tiles: [SessionTile]
+    let side: CGFloat = 54
+
+    private var urgent: Color {
+        for status in ["blocked", "working", "done"]
+            where tiles.contains(where: { $0.status == status }) {
+            return statusColor(status)
+        }
+        return statusColor("idle")
+    }
+
+    var body: some View {
+        let cell = side * 0.3
+        ZStack {
+            ForEach(0..<min(tiles.count, 7), id: \.self) { index in
+                let angle = Double(index - 1) * .pi / 3
+                let offset = index == 0
+                    ? CGPoint.zero
+                    : CGPoint(x: cos(angle) * cell * 0.92,
+                              y: sin(angle) * cell * 0.92)
+                Hexagon(cornerRadius: 1.5)
+                    .fill(statusColor(tiles[index].status).opacity(0.85))
+                    .frame(width: cell * 0.8, height: cell * 0.92)
+                    .offset(x: offset.x, y: offset.y)
+            }
+            if tiles.isEmpty {
+                Hexagon(cornerRadius: 2)
+                    .stroke(.secondary.opacity(0.5), lineWidth: 1)
+                    .frame(width: cell, height: cell * 1.15)
+            }
+        }
+        .frame(width: side, height: side)
+        .glassEffect(.clear, in: .circle)
+        .overlay(Circle().stroke(urgent.opacity(0.5), lineWidth: 1))
+        .help("Hivemind — \(tiles.count) session(s). Hover to open.")
     }
 }
 
@@ -1860,60 +1979,51 @@ struct WidgetView: View {
     let width: CGFloat
     let height: CGFloat
 
+    @Binding var collapsed: Bool
+    let interact: () -> Void
+    @State private var hoveredName: String?
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Text("Hivemind")
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundStyle(.tertiary)
-                    .kerning(0.4)
-                Spacer()
-                // Cycles corners on click. A Menu here inflated the row: macOS
-                // menu controls carry a minimum control height regardless of
-                // what the label contains. Right-click the panel for the list.
-                Button {
-                    let all = Corner.allCases
-                    let next = (all.firstIndex(of: corner).map { $0 + 1 } ?? 0)
-                        % all.count
-                    corner = all[next]
-                } label: {
-                    Ph.hexagonBold.scaledToFit()
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 9, height: 9)
-                }
-                .buttonStyle(.plain)
-                .help("Move to the next corner — \(corner.label)")
-                Button(action: expand) {
-                    Ph.cornersOutBold.scaledToFit()
-                        .foregroundStyle(.secondary)
-                        .frame(width: 10, height: 10)
-                }
-                .buttonStyle(.plain)
-                .keyboardShortcut("m", modifiers: [.command, .shift])
-                .help("Back to the full window")
+        Group {
+            if collapsed {
+                CombBadge(tiles: tiles)
+                    .onHover { over in
+                        if over {
+                            interact()
+                            withAnimation(.spring(response: 0.42,
+                                                  dampingFraction: 0.78)) {
+                                collapsed = false
+                            }
+                        }
+                    }
+            } else {
+                panel
             }
-            .frame(height: 12)
+        }
+        .onHover { over in if over { interact() } }
+    }
+
+    private var panel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            header
             if tiles.isEmpty {
                 Text("No open sessions")
                     .font(.system(size: 10, design: .rounded))
                     .foregroundStyle(.tertiary)
-                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 10)
             } else {
-                // Scrollable on purpose: windowResizability(.contentMinSize)
-                // enforces the content's minimum as the window's minimum, and a
-                // plain VStack of rows cannot compress, so the window could not
-                // be made small. A ScrollView has a negligible minimum.
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(tiles) { tile in
-                            WidgetRow(tile: tile, focus: focus)
-                        }
-                    }
-                }
-                .scrollIndicators(.never)
-                // Caps the panel: beyond this the rows scroll rather than the
-                // window growing down the screen.
-                .frame(maxHeight: 190)
+                MiniComb(tiles: tiles, width: width - 18, focus: focus,
+                         hoveredName: $hoveredName)
+                    .frame(maxWidth: .infinity)
+                // Names do not fit inside a 34pt hexagon, so the hovered one is
+                // named here instead of crowding every tile.
+                Text(hoveredName ?? " ")
+                    .font(.system(size: 9.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .center)
             }
             if !limits.isEmpty {
                 Divider().padding(.vertical, 1)
@@ -1938,7 +2048,7 @@ struct WidgetView: View {
             }
         }
         .padding(.horizontal, 9)
-        .padding(.top, 7)
+        .padding(.top, 6)
         .padding(.bottom, 9)
         // minHeight is what actually sets the window size, since
         // windowResizability(.contentMinSize) enforces the content's minimum.
@@ -1958,6 +2068,45 @@ struct WidgetView: View {
             Divider()
             Button("Full window", action: expand)
         }
+    }
+
+    private var header: some View {
+        HStack(spacing: 2) {
+            Text("Hivemind")
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .foregroundStyle(.tertiary)
+                .kerning(0.4)
+            Spacer(minLength: 4)
+            // 22pt hit targets. These were 9pt icons with no padding before,
+            // which is why the expand button was effectively unclickable.
+            iconButton(Ph.hexagonBold, "Next corner — \(corner.label)") {
+                let all = Corner.allCases
+                let next = (all.firstIndex(of: corner).map { $0 + 1 } ?? 0)
+                    % all.count
+                corner = all[next]
+            }
+            iconButton(Ph.minusBold, "Collapse to a badge") {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.78)) {
+                    collapsed = true
+                }
+            }
+            iconButton(Ph.cornersOutBold, "Full window", action: expand)
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+        }
+        .frame(height: 22)
+    }
+
+    private func iconButton(_ icon: Image, _ hint: String,
+                            action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            icon.scaledToFit()
+                .foregroundStyle(.secondary)
+                .frame(width: 10, height: 10)
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(hint)
     }
 }
 
@@ -2418,13 +2567,20 @@ struct ContentView: View {
     @AppStorage("widgetMode") private var widget = false
     @AppStorage("widgetCorner") private var corner: Corner = .topTrailing
 
-    private let widgetWidth: CGFloat = 226
+    @State private var widgetCollapsed = false
+    @State private var lastInteraction = Date()
+    private let badgeSide: CGFloat = 54
+    private let idleTick = Timer.publish(every: 5, on: .main, in: .common)
+        .autoconnect()
 
-    // Rows are capped and scroll past eight, so this stays bounded.
+    private var widgetWidth: CGFloat { widgetCollapsed ? badgeSide : 226 }
+
     private var widgetHeight: CGFloat {
-        let rows = CGFloat(min(max(model.tiles.count, 1), 8))
+        guard !widgetCollapsed else { return badgeSide }
+        let comb = MiniComb.size(count: model.tiles.count, width: 226 - 18)
         let limits = CGFloat(model.usageLimits.count)
-        return 24 + rows * 23 + (limits > 0 ? limits * 15 + 10 : 0) + 12
+        return 22 + 6 + max(comb.height, 24) + 20
+            + (limits > 0 ? limits * 15 + 10 : 0) + 15
     }
 
     private var tiles: [SessionTile] {
@@ -2449,8 +2605,13 @@ struct ContentView: View {
                 WidgetView(
                     tiles: model.tiles, limits: model.usageLimits,
                     corner: $corner, focus: model.focus,
-                    expand: { widget = false },
-                    width: widgetWidth, height: widgetHeight)
+                    expand: {
+                        widgetCollapsed = false
+                        widget = false
+                    },
+                    width: widgetWidth, height: widgetHeight,
+                    collapsed: $widgetCollapsed,
+                    interact: { lastInteraction = Date() })
                     .ignoresSafeArea()
             } else {
                 fullView
@@ -2458,6 +2619,18 @@ struct ContentView: View {
         }
         .background(WindowStyler(widget: widget, corner: corner,
                                  width: widgetWidth, height: widgetHeight))
+        // A coarse timer rather than a pending sleep: the 2 second session
+        // refresh re-creates the widget view, which restarted a .task(id:)
+        // before it ever reached a minute. Only fires state when it flips, so
+        // it costs nothing under the glass.
+        .onReceive(idleTick) { _ in
+            guard widget, !widgetCollapsed,
+                  Date().timeIntervalSince(lastInteraction) >= 60
+            else { return }
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.8)) {
+                widgetCollapsed = true
+            }
+        }
     }
 
     private var fullView: some View {
@@ -2466,7 +2639,11 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 HeaderView(tiles: tiles, mode: $mode, agentFilter: $agentFilter,
                            query: $query, agentCounts: model.agentCounts,
-                           enterWidget: { widget = true })
+                           enterWidget: {
+                               widgetCollapsed = false
+                               lastInteraction = Date()
+                               widget = true
+                           })
                 Group {
                     if tiles.isEmpty {
                         EmptyStateView(query: query)
