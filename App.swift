@@ -2163,7 +2163,9 @@ struct HeaderView: View {
         HStack(spacing: 10) {
             Text("Hivemind")
                 .font(.system(size: 20, weight: .bold, design: .rounded))
-            if agentCounts.count > 1 {
+            // Also shown when a filter is active, so there is always a way back
+            // to All even if only one agent is left running.
+            if agentCounts.count > 1 || agentFilter != "all" {
                 AgentTabs(selection: $agentFilter, counts: agentCounts)
             }
             Spacer()
@@ -2585,6 +2587,14 @@ struct ContentView: View {
             + (limits > 0 ? limits * 15 + 10 : 0) + 15
     }
 
+    // The agent filter is remembered, so closing the last session of the
+    // selected agent used to leave an empty window with no way back: the tabs
+    // hide when only one agent is running, which is exactly then.
+    private func dropEmptyAgentFilter(_ counts: [String: Int]) {
+        guard agentFilter != "all", (counts[agentFilter] ?? 0) == 0 else { return }
+        agentFilter = "all"
+    }
+
     private var badgeAlignment: Alignment {
         switch corner {
         case .topLeading: return .topLeading
@@ -2671,6 +2681,7 @@ struct ContentView: View {
         }
         .background(WindowStyler(widget: widget, corner: corner, box: windowBox))
         .onAppear {
+            dropEmptyAgentFilter(model.agentCounts)
             // Launching straight into widget mode leaves whatever frame the
             // window had. Delayed so it lands well clear of the launch layout
             // pass, where the same call is fatal.
@@ -2678,6 +2689,9 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                 resizeForMode(widget: true)
             }
+        }
+        .onChange(of: model.agentCounts) { _, counts in
+            dropEmptyAgentFilter(counts)
         }
         // A coarse timer rather than a pending sleep: the 2 second session
         // refresh re-creates the widget view, which restarted a .task(id:)
