@@ -24,6 +24,17 @@ much of your plan allowance you have spent.
 open Hivemind.app
 ```
 
+To launch it from anywhere instead:
+
+```sh
+./scripts/install.sh
+```
+
+That builds, symlinks the app into `~/Applications` so Spotlight and the Dock can find it, and
+writes a `hivemind` launcher into `~/.local/bin`. Then `hivemind` opens the app and
+`hivemind --dump` runs the checks below. The symlink means a later `./build.sh` is picked up with
+no reinstall; re-run the installer only if you move the repo.
+
 There is no Xcode project and no package manifest. `build.sh` is a single `swiftc` call plus a
 copy of the icons, so a build takes a few seconds.
 
