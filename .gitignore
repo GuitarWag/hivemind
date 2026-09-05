@@ -1,3 +1,7 @@
 Hivemind.app/
 .build/
 .DS_Store
+
+# Raw screenshots: they show real session and project names.
+# Only the redacted copies belong in the repo.
+images/print.png

@@ -3,6 +3,8 @@
 A native macOS app that shows every open AI coding session as a tile in a honeycomb, with live
 status, and opens the right terminal tab when you click one.
 
+![Hivemind](images/print-safe.png)
+
 It watches Claude Code and Codex sessions, reports their status (working, idle, blocked, done),
 the model each one runs, how much of its context window it has used, which app hosts it, and how
 much of your plan allowance you have spent.

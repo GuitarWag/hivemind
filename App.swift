@@ -1,6 +1,49 @@
+import Carbon.HIToolbox
 import Charts
 import Combine
 import SwiftUI
+
+// MARK: - Global hotkey
+
+// Carbon, not an NSEvent global monitor: a monitor needs Accessibility
+// permission, cannot consume the keystroke, and stops working whenever that
+// permission is reset. RegisterEventHotKey needs no permission at all.
+//
+// To change the shortcut, edit keyCode and modifiers below. Key codes are the
+// kVK_ANSI_* constants; modifiers are cmdKey, optionKey, shiftKey, controlKey.
+final class HotKeyCenter: @unchecked Sendable {
+    static let shared = HotKeyCenter()
+
+    static let keyCode = UInt32(kVK_ANSI_H)
+    static let modifiers = UInt32(cmdKey | optionKey | shiftKey)
+
+    private var reference: EventHotKeyRef?
+    private var installed = false
+    var onFire: (@Sendable () -> Void)?
+
+    func fire() {
+        let action = onFire
+        DispatchQueue.main.async { action?() }
+    }
+
+    @discardableResult
+    func register() -> OSStatus {
+        guard !installed else { return noErr }
+        installed = true
+
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            HotKeyCenter.shared.fire()
+            return noErr
+        }, 1, &spec, nil, nil)
+
+        // "HVMD"
+        let id = EventHotKeyID(signature: OSType(0x4856_4D44), id: 1)
+        return RegisterEventHotKey(Self.keyCode, Self.modifiers, id,
+                                   GetApplicationEventTarget(), 0, &reference)
+    }
+}
 import UserNotifications
 
 // MARK: - Phosphor icons (vendored SVGs, see icons/LICENSE)
@@ -1526,7 +1569,9 @@ struct ZoomControls: View {
     }
 
     private func button(_ icon: Image, _ label: String,
-                        _ modifiers: EventModifiers, _ key: KeyEquivalent,
+                        // Qualified: Carbon declares an EventModifiers too.
+                        _ modifiers: SwiftUI.EventModifiers,
+                        _ key: KeyEquivalent,
                         action: @escaping () -> Void) -> some View {
         Button {
             withAnimation(.spring(duration: 0.35)) { action() }
@@ -2587,6 +2632,22 @@ struct ContentView: View {
             + (limits > 0 ? limits * 15 + 10 : 0) + 15
     }
 
+    // Summon and dismiss: front the app, or hide it if it is already frontmost.
+    // A collapsed widget opens, so the hotkey always leaves something readable.
+    private func summon() {
+        if NSApp.isActive {
+            NSApp.hide(nil)
+            return
+        }
+        // NSApp.activate(), not activate(ignoringOtherApps:), which is
+        // deprecated since macOS 14 and no longer reliably raises the app.
+        NSApp.activate()
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        windowBox.window?.makeKeyAndOrderFront(nil)
+        lastInteraction = Date()
+        if widget, widgetCollapsed { setCollapsed(false) }
+    }
+
     // The agent filter is remembered, so closing the last session of the
     // selected agent used to leave an empty window with no way back: the tabs
     // hide when only one agent is running, which is exactly then.
@@ -2682,6 +2743,14 @@ struct ContentView: View {
         .background(WindowStyler(widget: widget, corner: corner, box: windowBox))
         .onAppear {
             dropEmptyAgentFilter(model.agentCounts)
+            // fire() already hops to the main queue, where the view lives.
+            HotKeyCenter.shared.onFire = { MainActor.assumeIsolated { summon() } }
+            let status = HotKeyCenter.shared.register()
+            if status != noErr {
+                FileHandle.standardError.write(Data(
+                    "hivemind: global hotkey unavailable (OSStatus \(status)), another app owns it\n"
+                        .utf8))
+            }
             // Launching straight into widget mode leaves whatever frame the
             // window had. Delayed so it lands well clear of the launch layout
             // pass, where the same call is fatal.
@@ -2908,6 +2977,13 @@ struct HivemindApp: App {
                 print("stats\t\(day.formatted(date: .numeric, time: .omitted))"
                       + "\t\(formatTokens(tokens))")
             }
+            // A hotkey another app already owns fails here rather than silently
+            // never firing. -9878 is eventHotKeyExistsErr.
+            let hotKey = HotKeyCenter.shared.register()
+            print(hotKey == noErr
+                  ? "hotkey ok; cmd-opt-shift-H registered"
+                  : "hotkey UNAVAILABLE (OSStatus \(hotKey)); another app owns it")
+
             precondition(fuzzyScore("wiz", "wizard-of-envs") != nil)
             precondition(fuzzyScore("wzenv", "wizard-of-envs") != nil,
                          "gapped subsequence must match")
